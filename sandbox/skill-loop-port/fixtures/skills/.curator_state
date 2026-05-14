@@ -1,0 +1,9 @@
+{
+  "last_report_path": "D:\\Self-Evolving Agent Platform\\sandbox\\skill-loop-port\\fixtures\\logs\\curator\\20260513-042814",
+  "last_run_at": null,
+  "last_run_duration_seconds": 21.161922,
+  "last_run_summary": "dry-run auto: no changes; llm: I'll scan the candidate list, identify clusters, and produce a dry-run report describing what I would do.\n\n## Cluster analysis\n\nOnly 5 agent-created skills, forming two clear prefix clusters:\n\n**Cluster 1: `hermes-config-*` (3 skills)**\n- `…",
+  "last_run_summary_shown_at": null,
+  "paused": false,
+  "run_count": 0
+}

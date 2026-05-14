@@ -1,0 +1,100 @@
+/* Google Fonts: Noto Sans KR — 한국어 산세리프 표준. 변수 폰트.
+   사용자 결정 2026-05-13 (UI 한국어 특화 + 구글 웹폰트).
+   @import 규칙은 다른 룰보다 먼저 와야 한다 (CSS spec). */
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap");
+@import "tailwindcss";
+
+/* Light theme (기본). Open WebUI 의 시각 언어를 두 테마로 재해석.
+   사용자가 토글하면 <html class="dark"> 로 다크 토큰으로 swap. */
+:root {
+  --color-bg: #ffffff;
+  --color-bg-sidebar: #f7f7f8;
+  --color-bg-input: #f0f0f2;
+  --color-bg-hover: #ececef;
+  --color-bg-card: #ffffff;
+  --color-border: #e5e5ea;
+  --color-border-strong: #d1d1d6;
+  --color-text: #1f1f23;
+  --color-text-muted: #6b7280;
+  --color-text-dim: #9ca3af;
+  --color-accent: #7c3aed;
+  --color-accent-bg: rgba(124, 58, 237, 0.10);
+  --color-danger: #dc2626;
+  --color-success: #059669;
+}
+
+/* Dark theme — Open WebUI 스크린샷 기준 톤. */
+html.dark {
+  --color-bg: #1a1a1a;
+  --color-bg-sidebar: #171717;
+  --color-bg-input: #2a2a2a;
+  --color-bg-hover: #232323;
+  --color-bg-card: #1f1f1f;
+  --color-border: #2a2a2a;
+  --color-border-strong: #3a3a3a;
+  --color-text: #ececec;
+  --color-text-muted: #9ca3af;
+  --color-text-dim: #6b7280;
+  --color-accent: #c084fc;
+  --color-accent-bg: rgba(192, 132, 252, 0.12);
+  --color-danger: #ef4444;
+  --color-success: #10b981;
+}
+
+/* Tailwind v4 의 @theme 블록은 변수를 빌드 타임에 고정시키므로
+   런타임 테마 토글에 부적합 — 우리는 :root 변수에 의지하고
+   className 으로 `bg-[var(--color-bg)]` 식 임의 값 사용. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family:
+    "Noto Sans KR",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Apple SD Gothic Neo",
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  transition: background-color 150ms ease;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-dim);
+}
+
+code {
+  font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+  font-size: 0.875em;
+  background: var(--color-bg-input);
+  padding: 0.125em 0.375em;
+  border-radius: 4px;
+}

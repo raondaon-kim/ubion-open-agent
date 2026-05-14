@@ -1,0 +1,33 @@
+[package]
+name = "ubion-agent"
+version = "0.1.0"
+description = "Ubion Self-Evolving Agent — Tauri shell"
+authors = ["Ubion ax center"]
+edition = "2021"
+rust-version = "1.77"
+
+# Phase 3 (사용자 결정 2026-05-14): Rust 외피 + Python 알맹이.
+# 이 크레이트는 트레이 아이콘 / Python supervisor / webview 호스팅 / 사내
+# 코디네이터 websocket 만 책임. 에이전트 두뇌는 spawn 된 Python 자식
+# 프로세스에 산다. PROJECT_SPEC v0.4 §2.7 참조.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+# By default, build with the "custom-protocol" feature for production
+# bundles (loads UI from the embedded dist/). Dev mode bypasses this and
+# uses vite's dev server.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"

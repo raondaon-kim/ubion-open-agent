@@ -1,0 +1,42 @@
+{
+  "hermes-config-init": {
+    "created_at": "2026-03-01T10:00:00+00:00",
+    "created_by": "agent",
+    "last_used_at": "2026-04-15T09:00:00+00:00",
+    "pinned": false,
+    "state": "active",
+    "use_count": 3
+  },
+  "hermes-config-update": {
+    "created_at": "2026-03-10T11:00:00+00:00",
+    "created_by": "agent",
+    "last_used_at": "2026-04-20T14:30:00+00:00",
+    "pinned": false,
+    "state": "active",
+    "use_count": 7
+  },
+  "hermes-config-validate": {
+    "created_at": "2026-03-12T13:00:00+00:00",
+    "created_by": "agent",
+    "last_used_at": "2026-04-01T08:00:00+00:00",
+    "pinned": false,
+    "state": "active",
+    "use_count": 2
+  },
+  "pr-review-checklist": {
+    "created_at": "2026-02-20T15:00:00+00:00",
+    "created_by": "agent",
+    "last_used_at": "2026-05-01T16:00:00+00:00",
+    "pinned": false,
+    "state": "active",
+    "use_count": 12
+  },
+  "pr-review-merge-prep": {
+    "created_at": "2026-04-05T12:00:00+00:00",
+    "created_by": "agent",
+    "last_used_at": "2026-05-10T11:00:00+00:00",
+    "pinned": false,
+    "state": "active",
+    "use_count": 4
+  }
+}

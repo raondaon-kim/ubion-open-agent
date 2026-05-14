@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+
+# Embedded python-build-standalone interpreter (~67 MB, 3000+ files).
+# Re-fetched by a setup script on clean checkouts; never commit.
+/python/
+
+# Bundled engine snapshot (copied from ../engine at build time).
+/engine/
+
+# Tauri signing key — NEVER commit (private key for auto-updater).
+/.tauri/
+
+# python-build-standalone tarball cache (re-downloaded by build-payload.ps1)
+/.payload-cache/

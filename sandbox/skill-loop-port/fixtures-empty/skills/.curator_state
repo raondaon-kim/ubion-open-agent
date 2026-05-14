@@ -1,0 +1,9 @@
+{
+  "last_report_path": "D:\\Self-Evolving Agent Platform\\sandbox\\skill-loop-port\\fixtures-empty\\logs\\curator\\20260513-042858",
+  "last_run_at": null,
+  "last_run_duration_seconds": 0.00573,
+  "last_run_summary": "dry-run auto: no changes; llm: skipped (no candidates)",
+  "last_run_summary_shown_at": null,
+  "paused": false,
+  "run_count": 0
+}

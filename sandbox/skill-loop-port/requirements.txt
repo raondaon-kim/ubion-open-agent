@@ -1,0 +1,6 @@
+# Minimum runtime deps for the skill-loop-port sandbox.
+# The vendored curator.py / skill_usage.py themselves rely only on stdlib;
+# anthropic is needed by mock_agent.py for the real LLM call.
+
+anthropic>=0.39
+python-dotenv>=1.0
