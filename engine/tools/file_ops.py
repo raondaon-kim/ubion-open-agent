@@ -149,6 +149,7 @@ def create_workspace_file(path: str, content: str, *, binary_b64: bool = False) 
     """
     resolved = _resolve_for_workspace_create(path)
     if isinstance(resolved, str):
+        logger.info("create_workspace_file: REFUSED %r — %s", path, resolved)
         return tool_error(resolved)
     if content is None:
         return tool_error("missing 'content'")
@@ -166,7 +167,12 @@ def create_workspace_file(path: str, content: str, *, binary_b64: bool = False) 
             resolved.write_text(content, encoding="utf-8")
             written = len(content.encode("utf-8"))
     except OSError as exc:
+        logger.warning("create_workspace_file: write failed %s: %s", resolved, exc)
         return tool_error(f"cannot create {path!r}: {exc}")
+    logger.info(
+        "create_workspace_file: CREATED %s (%d bytes%s)",
+        resolved, written, ", binary" if binary_b64 else "",
+    )
     return tool_result(
         path=str(resolved),
         bytes_written=written,

@@ -232,12 +232,25 @@ def _run_single(
 ) -> Dict[str, Any]:
     """Execute one child synchronously. Never raises — packs failures into the dict."""
     started = time.monotonic()
+    goal_preview = goal[:80].replace("\n", " ") + ("..." if len(goal) > 80 else "")
+    logger.info(
+        "delegate child %d START goal=%r depth=%d",
+        task_index, goal_preview, getattr(child, "_delegate_depth", "?"),
+    )
     try:
         out = child.run_conversation(user_message=goal)
         elapsed = time.monotonic() - started
+        status = "ok" if not out.get("error") else "error"
+        logger.info(
+            "delegate child %d DONE status=%s api_calls=%d tools=%d dur=%.1fs",
+            task_index, status,
+            int(out.get("api_calls", 0) or 0),
+            int(out.get("tool_calls_made", 0) or 0),
+            elapsed,
+        )
         return {
             "task_index": task_index,
-            "status": "ok" if not out.get("error") else "error",
+            "status": status,
             "summary": out.get("final_response", ""),
             "exit_reason": out.get("exit_reason", ""),
             "api_calls": int(out.get("api_calls", 0) or 0),

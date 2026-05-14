@@ -296,6 +296,21 @@ class AIAgent:
             "conversation turn: task=%s history=%d msg=%r",
             ctx.task_id, len(ctx.messages) - 1, _msg_preview,
         )
+        # One-shot inventory log so server.log records what THIS turn
+        # could call. Doesn't repeat per LLM iteration to keep the log
+        # readable — but on a hang the tool list explains "is X even
+        # registered for this turn?". Cheap to compute.
+        depth = getattr(self, "_delegate_depth", 0)
+        depth_tag = f"[d={depth}] " if depth else ""
+        tool_names = sorted(self._tools.keys())
+        logger.info(
+            "%sturn inventory: model=%s tools=%d [%s] max_iter=%d",
+            depth_tag,
+            self.model,
+            len(tool_names),
+            ", ".join(tool_names),
+            self.max_iterations,
+        )
         # Attach the callback to ``self`` so _run_loop (and the helpers it
         # delegates to) can reach it without thread the parameter through
         # every internal API.
@@ -810,6 +825,29 @@ class AIAgent:
             # Record the assistant turn in the shape curator walks.
             self._session_messages.append(
                 _assistant_turn_record(response)
+            )
+
+            # One-line per-turn summary — vital for diagnosis when the
+            # UI shows "thinking (turn 18)" forever: this log tells
+            # whether the model actually returned anything, what
+            # tool_calls (if any) it produced, and how big the
+            # reasoning burst was. Without this the turn boundary is
+            # invisible in server.log.
+            depth = getattr(self, "_delegate_depth", 0)
+            depth_tag = f"[d={depth}] " if depth else ""
+            tool_names = (
+                ", ".join(tc.name for tc in response.tool_calls)
+                if response.tool_calls
+                else "—"
+            )
+            logger.info(
+                "%sturn %d done: text=%d reasoning=%d tools=[%s] stop=%s",
+                depth_tag,
+                api_call_count,
+                len(response.text or ""),
+                len(getattr(response, "reasoning_content", "") or ""),
+                tool_names,
+                response.stop_reason or "?",
             )
 
             if not response.tool_calls:

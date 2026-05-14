@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Mapping
 
 from engine.llm.anthropic import ToolCall
@@ -123,6 +124,12 @@ def execute_tool_calls_sequential(
     bool`. The returned list always has the same length as `tool_calls` and
     preserves order (Anthropic pairs tool_result blocks to tool_use ids in
     the next user message — every id needs a match).
+
+    Logging contract: every dispatch — start, finish, error, skip — is
+    logged at INFO so server.log shows the agent's actual move list.
+    Without this, "quiet" tools (skill_view, todo, memory, delegate)
+    leave no trace and `server.log` looks like the agent is hanging
+    when it's actually executing a sequence the user can't see.
     """
     results: List[Dict[str, Any]] = []
     interrupted = False
@@ -134,19 +141,37 @@ def execute_tool_calls_sequential(
             # so we sticky-bit it here to keep ordering consistent even
             # if the agent clears _interrupt_requested later.
             interrupted = True
+            logger.info("tool dispatch: SKIP %s (interrupted)", call.name)
             results.append(_skip_block(call))
             continue
 
         tool = agent._tools.get(call.name) if hasattr(agent, "_tools") else None
         if tool is None:
+            logger.warning("tool dispatch: UNKNOWN %s", call.name)
             results.append(_error_block(call, f"error: unknown tool {call.name!r}"))
             continue
 
         args = _coerce_arguments(call.arguments)
+        # Log the start with a short arg preview so we can read the
+        # trace without dumping huge schemas. Skip giant args (file
+        # contents etc.) past ~200 chars — they live in the result
+        # block when needed.
+        arg_preview = _summarize_args(args)
+        depth = getattr(agent, "_delegate_depth", 0)
+        depth_prefix = "  " * depth + (f"[depth={depth}] " if depth else "")
+        logger.info(
+            "%stool dispatch: START %s(%s)",
+            depth_prefix, call.name, arg_preview,
+        )
+        t0 = time.monotonic()
         try:
             value = tool.handler(args)
         except Exception as exc:
-            logger.exception("Tool %s raised: %s", call.name, exc)
+            elapsed = time.monotonic() - t0
+            logger.exception(
+                "%stool dispatch: ERROR %s after %.2fs: %s",
+                depth_prefix, call.name, elapsed, exc,
+            )
             results.append(
                 _error_block(call, f"error: {type(exc).__name__}: {exc}")
             )
@@ -155,6 +180,69 @@ def execute_tool_calls_sequential(
             # same here — do NOT trip `interrupted`.
             continue
 
+        elapsed = time.monotonic() - t0
+        result_preview = _summarize_result(value)
+        logger.info(
+            "%stool dispatch: DONE  %s after %.2fs → %s",
+            depth_prefix, call.name, elapsed, result_preview,
+        )
         results.append(_ok_block(call, value))
 
     return results
+
+
+def _summarize_args(args: Dict[str, Any]) -> str:
+    """One-line preview of a tool's arguments for the start log.
+
+    Keep it under ~200 chars total so server.log stays readable. Long
+    string values get truncated to their first 80 chars; the full
+    payload (file contents, base64 blobs, etc.) lives in the result
+    block when the model needs to reason about it.
+    """
+    if not isinstance(args, dict) or not args:
+        return ""
+    parts: List[str] = []
+    for key, value in args.items():
+        if isinstance(value, str):
+            preview = value if len(value) <= 80 else value[:77] + "..."
+            parts.append(f"{key}={preview!r}")
+        elif isinstance(value, (int, float, bool)) or value is None:
+            parts.append(f"{key}={value!r}")
+        elif isinstance(value, (list, tuple)):
+            parts.append(f"{key}=<{type(value).__name__} len={len(value)}>")
+        elif isinstance(value, dict):
+            parts.append(f"{key}=<dict keys={list(value)[:4]}>")
+        else:
+            parts.append(f"{key}=<{type(value).__name__}>")
+    summary = ", ".join(parts)
+    if len(summary) > 200:
+        summary = summary[:197] + "..."
+    return summary
+
+
+def _summarize_result(value: Any) -> str:
+    """One-line preview of a tool result for the DONE log.
+
+    JSON-shaped strings (most of our tools return those) are flattened
+    to their top-level keys so the log is greppable. Plain strings get
+    truncated. Falls through to ``type(value).__name__`` for anything
+    else so we never raise from inside the logger.
+    """
+    try:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:  # noqa: BLE001
+                    parsed = None
+                if isinstance(parsed, dict):
+                    keys = list(parsed)[:6]
+                    extra = "" if len(parsed) <= 6 else f", ...{len(parsed)-6} more"
+                    return f"dict({', '.join(keys)}{extra})"
+                if isinstance(parsed, list):
+                    return f"list(len={len(parsed)})"
+            return repr(stripped[:120]) + ("..." if len(stripped) > 120 else "")
+        return f"<{type(value).__name__}>"
+    except Exception:  # noqa: BLE001 — never break logging
+        return "<unprintable>"

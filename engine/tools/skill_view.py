@@ -25,12 +25,15 @@ Phase 1 Unit 2 scope:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from engine.core.agent import Tool
 from engine.skills import usage as skill_usage
 from engine.skills import utils as skill_utils
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA: Dict[str, Any] = {
@@ -116,6 +119,7 @@ def _handler(args: Dict[str, Any]) -> str:
 
     skill_dir = _find_skill_dir(name)
     if skill_dir is None:
+        logger.info("skill_view: NOT FOUND %r", name)
         return json.dumps(
             {"success": False, "error": f"skill not found: {name!r}"}
         )
@@ -124,9 +128,14 @@ def _handler(args: Dict[str, Any]) -> str:
     try:
         raw = skill_md_path.read_text(encoding="utf-8")
     except OSError as exc:
+        logger.warning("skill_view: cannot read %s: %s", skill_md_path, exc)
         return json.dumps(
             {"success": False, "error": f"cannot read SKILL.md: {exc}"}
         )
+    logger.info(
+        "skill_view: LOADED %r from %s (%d bytes)",
+        name, skill_dir, len(raw),
+    )
 
     # Template substitution (no inline shell — security). session_id is
     # not yet exposed in Unit 2; pass None and let unresolved tokens remain.

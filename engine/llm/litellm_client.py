@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MAX_TOKENS = 4096
+# Hard ceiling for one streaming request. Hit when the proxy keeps a
+# connection open but stops emitting chunks — without it the agent
+# loop hangs and the UI looks frozen.
+STREAM_TIMEOUT_S = 300
 
 
 class LiteLLMClient:
@@ -167,9 +171,23 @@ class LiteLLMClient:
             "messages": openai_messages,
             "max_tokens": max_tokens,
             "stream": True,
+            # Per-request timeout — covers the case where the proxy
+            # accepts the stream but then stops sending chunks
+            # (network hiccup, upstream model wedged). Without this
+            # the stream iterator blocks forever and the UI shows
+            # "thinking" for hours.
+            "timeout": STREAM_TIMEOUT_S,
         }
         if tools:
             request["tools"] = [_tool_to_openai(t) for t in tools]
+
+        logger.info(
+            "litellm chat_stream: model=%s messages=%d tools=%d max_tokens=%d",
+            self.model,
+            len(openai_messages),
+            len(tools or []),
+            max_tokens,
+        )
 
         text_parts: List[str] = []
         reasoning_parts: List[str] = []
@@ -269,11 +287,20 @@ class LiteLLMClient:
                 )
             )
 
+        final_text = "".join(text_parts).strip()
+        final_reasoning = "".join(reasoning_parts)
+        logger.info(
+            "litellm chat_stream done: text=%d reasoning=%d tool_calls=%d stop=%s",
+            len(final_text),
+            len(final_reasoning),
+            len(tool_calls),
+            stop_reason or "stop",
+        )
         return ChatResponse(
-            text="".join(text_parts).strip(),
+            text=final_text,
             tool_calls=tool_calls,
             stop_reason=stop_reason or "stop",
             usage=usage,
             raw=None,
-            reasoning_content="".join(reasoning_parts),
+            reasoning_content=final_reasoning,
         )
