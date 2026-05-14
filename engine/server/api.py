@@ -382,14 +382,46 @@ async def _stream_with_progress(
     })
 
     final_text = ""
+    streamed_chars = 0  # how many characters we already pushed as deltas
     finish_reason = "stop"
     while True:
         event_type, payload = await queue.get()
 
+        # Real-time token forwarding from the streaming LLM client. The
+        # agent loop fires this for every non-empty chunk; we pass it
+        # straight through as an OpenAI-compatible content delta so the
+        # existing web SSE parser shows it without any client changes.
+        if event_type == "text_delta":
+            chunk = payload.get("text", "") or ""
+            if not chunk:
+                continue
+            streamed_chars += len(chunk)
+            yield _sse_chunk({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": chunk},
+                    "finish_reason": None,
+                }],
+            })
+            continue
+
         if event_type == "final_text":
             final_text = payload.get("text", "") or ""
+            # If text_delta events already streamed the same content,
+            # skip the post-hoc resend so the UI doesn't see duplicate
+            # output. We still want to emit *whatever wasn't streamed*
+            # — e.g. when the non-streaming code path is in effect or
+            # the streaming client raised mid-stream and the agent
+            # fell back to a single chat() retry.
+            remaining = final_text[streamed_chars:]
+            if not remaining:
+                continue
             chunk_size = 50
-            for i in range(0, len(final_text), chunk_size):
+            for i in range(0, len(remaining), chunk_size):
                 yield _sse_chunk({
                     "id": request_id,
                     "object": "chat.completion.chunk",
@@ -397,7 +429,7 @@ async def _stream_with_progress(
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": final_text[i:i + chunk_size]},
+                        "delta": {"content": remaining[i:i + chunk_size]},
                         "finish_reason": None,
                     }],
                 })

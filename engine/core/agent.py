@@ -727,7 +727,18 @@ class AIAgent:
             result.api_calls = api_call_count
 
             self._emit_progress("llm_call_started", {"turn": api_call_count})
-            response = self._call_llm_with_retry(messages)
+
+            # Forward incremental text chunks to the progress callback so
+            # the SSE endpoint can push real token-by-token deltas to the
+            # UI instead of holding the whole reply until the model
+            # finishes. Falls back to the non-streaming path when the
+            # underlying client doesn't expose chat_stream() (Anthropic /
+            # DeepSeek direct paths in the current build).
+            def _on_text_delta(chunk: str, _i=api_call_count) -> None:
+                if chunk:
+                    self._emit_progress("text_delta", {"text": chunk, "turn": _i})
+
+            response = self._call_llm_with_retry(messages, on_text_delta=_on_text_delta)
             if response is None:
                 # _call_llm_with_retry already filled result.error / logged.
                 # Distinguish interrupt-during-retry from retry exhaustion.
@@ -788,9 +799,20 @@ class AIAgent:
                 return
 
     def _call_llm_with_retry(
-        self, messages: List[Dict[str, Any]]
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        on_text_delta: Optional[Callable[[str], None]] = None,
     ) -> Optional[ChatResponse]:
-        """Send one turn with retry. Returns None when all retries are spent."""
+        """Send one turn with retry. Returns None when all retries are spent.
+
+        When ``on_text_delta`` is provided AND the underlying client
+        exposes ``chat_stream`` (currently LiteLLM only), we take the
+        streaming path so the agent can emit ``text_delta`` progress
+        events for the SSE endpoint. Otherwise the call falls back to
+        the non-streaming ``chat`` method — the returned ChatResponse
+        shape is identical.
+        """
         tool_schemas: Optional[List[Dict[str, Any]]] = None
         if self._tools:
             tool_schemas = [
@@ -806,11 +828,26 @@ class AIAgent:
         # Caller-supplied prompts pass through untouched.
         active_system_prompt = self._build_system_prompt()
 
+        # Choose the call surface once per turn — switching between
+        # streaming and non-streaming mid-retry would just double the
+        # complexity without any user-visible benefit.
+        use_stream = (
+            on_text_delta is not None
+            and hasattr(self._llm, "chat_stream")
+        )
+
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries_per_call + 1):
             if self._interrupt_requested:
                 return None
             try:
+                if use_stream:
+                    return self._llm.chat_stream(
+                        messages=messages,
+                        system=active_system_prompt or None,
+                        tools=tool_schemas,
+                        on_text_delta=on_text_delta,
+                    )
                 return self._llm.chat(
                     messages=messages,
                     system=active_system_prompt or None,

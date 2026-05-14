@@ -33,9 +33,12 @@ proxy IS the OpenAI shape.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 try:
     from openai import OpenAI
@@ -45,7 +48,7 @@ except ImportError as exc:  # pragma: no cover — required dep
         "Install: pip install openai"
     ) from exc
 
-from engine.llm.anthropic import ChatResponse
+from engine.llm.anthropic import ChatResponse, ToolCall
 from engine.llm.deepseek import (
     _normalize_completion,
     _to_openai_messages,
@@ -119,3 +122,147 @@ class LiteLLMClient:
 
         completion = self._sdk.chat.completions.create(**request)
         return _normalize_completion(completion)
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        system: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        on_text_delta: Optional[Callable[[str], None]] = None,
+    ) -> ChatResponse:
+        """Streaming sibling of :meth:`chat`.
+
+        Forwards each text chunk to ``on_text_delta`` as it arrives, then
+        returns the aggregated ChatResponse once the stream ends. The
+        return shape is identical to ``chat()`` — same ``text``,
+        ``tool_calls``, ``stop_reason``, ``usage``, ``reasoning_content``
+        — so callers can plug streaming into the agent loop without
+        changing downstream code.
+
+        Streaming semantics:
+          * ``on_text_delta`` fires for every non-empty
+            ``delta.content`` chunk. The caller is responsible for any
+            UI thread hopping / queue.put_nowait dance.
+          * ``reasoning_content`` deltas are accumulated and returned in
+            the final ChatResponse but NOT pushed through
+            ``on_text_delta`` — the agent loop already special-cases
+            reasoning echoing for DeepSeek thinking mode.
+          * ``tool_calls`` arrive as partial chunks (id + name early,
+            arguments string built up across many chunks). We assemble
+            them here so the returned ChatResponse looks identical to
+            a non-streaming call. While tool_calls are streaming we do
+            NOT forward text — providers occasionally interleave a
+            short text preamble that callers can still see in
+            ``response.text``.
+        """
+        openai_messages = _to_openai_messages(messages, system=system)
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "messages": openai_messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if tools:
+            request["tools"] = [_tool_to_openai(t) for t in tools]
+
+        text_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        # Tool calls arrive in fragments — `index` ties them together.
+        # Each entry: {"id", "name", "args_chunks": [str, ...]}.
+        tool_buffers: Dict[int, Dict[str, Any]] = {}
+        stop_reason: str = ""
+        usage: Dict[str, int] = {}
+
+        stream = self._sdk.chat.completions.create(**request)
+        for chunk in stream:
+            choice = chunk.choices[0] if chunk.choices else None
+            if choice is None:
+                continue
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                # `[DONE]` sentinel, or trailing usage-only chunk.
+                fr = getattr(choice, "finish_reason", None)
+                if fr:
+                    stop_reason = fr
+                continue
+
+            # Text delta — forward immediately.
+            content = getattr(delta, "content", None)
+            if content:
+                text_parts.append(content)
+                if on_text_delta is not None:
+                    try:
+                        on_text_delta(content)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("on_text_delta raised: %s", exc)
+
+            # Reasoning delta — accumulate silently (echoed in next turn).
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(str(reasoning))
+
+            # Tool call fragments — assemble by index.
+            raw_calls = getattr(delta, "tool_calls", None) or []
+            for raw in raw_calls:
+                idx = getattr(raw, "index", 0) or 0
+                buf = tool_buffers.setdefault(
+                    idx,
+                    {"id": "", "name": "", "args_chunks": []},
+                )
+                rid = getattr(raw, "id", None)
+                if rid:
+                    buf["id"] = rid
+                fn = getattr(raw, "function", None)
+                if fn is not None:
+                    rname = getattr(fn, "name", None)
+                    if rname:
+                        buf["name"] = rname
+                    rargs = getattr(fn, "arguments", None)
+                    if rargs:
+                        buf["args_chunks"].append(rargs)
+
+            # finish_reason on a partial chunk (some providers send it
+            # alongside the last delta instead of in a separate frame).
+            fr = getattr(choice, "finish_reason", None)
+            if fr:
+                stop_reason = fr
+
+        # Usage often lands on the *last* chunk's `usage` field when the
+        # provider opts into stream_options.include_usage. Our request
+        # doesn't enable it explicitly, so this is best-effort.
+        if hasattr(chunk, "usage") and chunk.usage is not None:
+            try:
+                usage = {
+                    "input_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                }
+            except Exception:  # noqa: BLE001
+                usage = {}
+
+        # Reshape the assembled buffers into our ToolCall dataclass.
+        tool_calls: List[ToolCall] = []
+        for idx in sorted(tool_buffers.keys()):
+            buf = tool_buffers[idx]
+            args_raw = "".join(buf["args_chunks"]) or "{}"
+            try:
+                args_obj = json.loads(args_raw) if args_raw.strip() else {}
+            except json.JSONDecodeError:
+                args_obj = {}
+            tool_calls.append(
+                ToolCall(
+                    id=buf["id"] or f"call_{uuid.uuid4().hex[:24]}",
+                    name=buf["name"],
+                    arguments=args_obj if isinstance(args_obj, dict) else {},
+                )
+            )
+
+        return ChatResponse(
+            text="".join(text_parts).strip(),
+            tool_calls=tool_calls,
+            stop_reason=stop_reason or "stop",
+            usage=usage,
+            raw=None,
+            reasoning_content="".join(reasoning_parts),
+        )
