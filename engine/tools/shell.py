@@ -136,30 +136,54 @@ _DENY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 def _command_writes_outside_workspace(command: str, workspace: Path) -> Optional[str]:
     """Reject commands whose absolute paths point outside the workspace.
 
-    Mirrors Hermes' allow-list-style workdir validation: we scan for any
-    *absolute* path tokens in the command and require them to live under
-    the workspace (or be one of a tiny set of read-only system locations
-    like `C:\\Program Files`).
+    Defense-in-depth on top of the cwd lock: even if a command picks an
+    absolute path, refuse it when it's clearly outside the workspace
+    (or one of a tiny set of read-only system roots).
+
+    The matcher is intentionally conservative — false positives have
+    bitten us before, blocking legitimate PowerShell here-strings that
+    embedded URLs (``https://...``) or Python code with forward
+    slashes. The cwd invariant is the real safety net; this check is
+    just to catch obvious "write to C:\\Users\\someone-else\\..." attempts.
     """
-    # Match Windows-drive paths or POSIX absolute paths. We intentionally
-    # *don't* try to parse the shell — false negatives are OK (the cwd
-    # invariant still holds), but a clear absolute path to `C:\Users\…`
-    # other than workspace should be obvious-blocked.
-    abs_re = re.compile(r"(?:(?<=\s)|^)([A-Za-z]:[\\/][^\s\"']+|/[^\s\"']+)")
+    # Only match path-like tokens at a word boundary AND not preceded
+    # by `:` (so URLs like https://foo and module syntax like
+    # http://host don't trigger). The `(?<![:/A-Za-z])` lookbehind
+    # filters out:
+    #   * https:// → the `/` is preceded by `:` — skipped
+    #   * com/path → the `/` is preceded by a letter (not standalone) — skipped
+    #   * //share  → the second `/` is preceded by `/` — skipped (UNC paths
+    #                hit the Windows-drive branch separately if absolute)
+    abs_re = re.compile(
+        r"(?:(?<=\s)|^)([A-Za-z]:[\\/][^\s\"'<>|;&]+|(?<![:/A-Za-z])/[A-Za-z][^\s\"'<>|;&]*)"
+    )
     workspace_str = str(workspace).lower().rstrip("\\/")
-    # Allowlist a few obviously-read-only roots so users can do `python -m`
-    # against bundled libs, etc.
+    # Allowlist:
+    #   * the workspace itself
+    #   * obviously read-only system roots (Program Files, System32) so
+    #     `python -m` against bundled libs works
+    #   * POSIX read-only device paths the model uses for stdio redirection
+    #     (`/dev/null`, `/dev/stdin`, …) — they don't write to the FS, but
+    #     they live outside any workspace, so the naive check rejects them
     safe_prefixes = (
         workspace_str,
         r"c:\program files",
         r"c:\program files (x86)",
         r"c:\windows\system32",
         "/usr/", "/bin/", "/etc/",
+        "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr",
     )
     for match in abs_re.finditer(command):
-        candidate = match.group(1).lower().rstrip("\\/")
+        token = match.group(1)
+        # Skip tokens that are clearly part of a URL — the matcher's
+        # lookbehind catches the common case, but be defensive about
+        # things like `git+https://...` or `pip install foo @ git+...`.
+        start = match.start(1)
+        if start >= 2 and command[start - 2 : start] in ("//", ":/"):
+            continue
+        candidate = token.lower().rstrip("\\/")
         if not any(candidate.startswith(p) for p in safe_prefixes):
-            return f"absolute path {match.group(1)!r} escapes workspace ({workspace})"
+            return f"absolute path {token!r} escapes workspace ({workspace})"
     return None
 
 

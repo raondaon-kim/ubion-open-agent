@@ -180,6 +180,14 @@ class AIAgent:
         # progress events (used by the SSE chat endpoint).
         self._progress_callback: Optional[Any] = None
 
+        # Delegation bookkeeping — depth ticks up each time
+        # ``delegate_task`` spawns a child. Hard-capped in
+        # ``engine.tools.delegate`` to prevent runaway fan-out. ``role``
+        # is set by the parent when constructing this child; "leaf"
+        # means we never re-register delegate_task on ourselves.
+        self._delegate_depth: int = 0
+        self._delegate_role: str = "root"
+
         # Transcript of API turns. Each entry is an Anthropic-shaped dict.
         # Curator walks this list at curator.py:1751 to pull tool_calls
         # into its report.
@@ -368,6 +376,7 @@ class AIAgent:
         include_file_ops: bool = True,
         include_session_search: bool = True,
         include_hermes_tier_a: bool = True,
+        include_delegate: bool = True,
     ) -> None:
         """Attach the Phase 1 default toolset.
 
@@ -382,6 +391,13 @@ class AIAgent:
         When `include_session_search=True` (default) also attaches:
           - session_search  (Unit 9 vendored session search; FTS5-backed
             via engine.storage.session_db).
+
+        When `include_delegate=True` (default) also attaches:
+          - delegate_task  — spawn a child AIAgent for a focused subtask
+            in a fresh conversation. The handler is a closure over THIS
+            agent so the child gets the right parent reference at call
+            time. Children are forced to leaf-role so the same call site
+            handles depth-limiting transparently.
 
         Idempotent — calling this twice doesn't duplicate entries.
         """
@@ -406,6 +422,15 @@ class AIAgent:
         if include_session_search:
             from engine.tools import build_session_search_tool
             catalogue.append(build_session_search_tool())
+
+        # Delegation is the OUR addition (Hermes ships its own 2700-line
+        # version; we keep a ~350-line Phase 1 surface). A "leaf" child
+        # never re-registers this on itself, both because the handler
+        # passes the parent reference and because depth-limit refuses
+        # the call anyway.
+        if include_delegate and self._delegate_role != "leaf":
+            from engine.tools.delegate import build_delegate_tool
+            catalogue.append(build_delegate_tool(self))
 
         if include_hermes_tier_a:
             # Importing these modules triggers their module-level

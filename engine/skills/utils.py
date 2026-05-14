@@ -296,12 +296,35 @@ def get_external_skills_dirs() -> List[Path]:
 
 
 def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
+    """Return all skill directories the prompt builder + tools should consider.
 
-    The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    Layout:
+      1. ``<agent_home>/skills/`` — the user's writable pool (custom +
+         installed). Always first so user/AI-authored skills win on name
+         conflict. Always included even when it doesn't exist yet —
+         callers handle that.
+      2. ``<install>/skills-bundle-optional/`` — the read-only bundled
+         pool shipped with the installer (~80 productivity, creative,
+         devops skills). Including this in the index means the LLM
+         sees, e.g., `powerpoint`, `manim-video`, `architecture-diagram`
+         straight away without the user having to run `skill_install`
+         first. ``skill_view`` resolves names against the same union,
+         so loading still works without copying anything to disk.
+      3. External skill dirs from the user's config (advanced).
+
+    Bundled skills are listed *after* the writable pool intentionally:
+    a same-named skill in ``skills/custom/`` overrides the bundled
+    version, which is how user fine-tuning of a stock skill keeps
+    working across installer updates.
     """
     dirs = [get_skills_dir()]
+    try:
+        from engine.storage.agent_home import get_optional_skills_dir
+        bundled = get_optional_skills_dir()
+        if bundled is not None and bundled.is_dir():
+            dirs.append(bundled)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.debug("get_optional_skills_dir failed: %s", exc)
     dirs.extend(get_external_skills_dirs())
     return dirs
 

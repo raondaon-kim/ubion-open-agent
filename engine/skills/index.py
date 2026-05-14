@@ -102,21 +102,23 @@ def _save_index(entries: Dict[str, SkillIndexEntry]) -> None:
 
 
 def _scan_skill_files() -> List[Path]:
-    """Enumerate all SKILL.md files across the active skills directories.
+    """Enumerate all SKILL.md files across every active skills directory.
 
-    Mirrors the rglob behavior used elsewhere in manager.py — keeps the
-    EXCLUDED_SKILL_DIRS filter consistent so the index never shadows the
-    excluded set.
+    Walks the same union ``get_all_skills_dirs()`` returns — writable
+    pool first, then the bundled read-only pool, then any external
+    dirs. The EXCLUDED_SKILL_DIRS filter (.archive, .hub, ...) is
+    applied uniformly so excluded names never sneak into the index
+    from one of the alternate roots.
     """
-    from engine.skills.utils import EXCLUDED_SKILL_DIRS
-    skills_dir = get_skills_dir()
-    if not skills_dir.exists():
-        return []
+    from engine.skills.utils import EXCLUDED_SKILL_DIRS, get_all_skills_dirs
     out: List[Path] = []
-    for skill_md in skills_dir.rglob("SKILL.md"):
-        if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
             continue
-        out.append(skill_md)
+        for skill_md in skills_dir.rglob("SKILL.md"):
+            if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            out.append(skill_md)
     return out
 
 

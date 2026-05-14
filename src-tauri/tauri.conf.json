@@ -41,7 +41,8 @@
     ],
     "resources": [
       "python/**/*",
-      "engine/**/*"
+      "engine/**/*",
+      "skills-bundle-optional/**/*"
     ],
     "windows": {
       "nsis": {

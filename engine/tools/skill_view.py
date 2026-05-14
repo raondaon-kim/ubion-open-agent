@@ -64,27 +64,37 @@ DESCRIPTION = (
 
 
 def _find_skill_dir(name: str) -> Optional[Path]:
-    """Locate the directory of skill ``name``. Returns None if not found."""
-    skills_root = skill_utils.get_skills_dir()
-    if not skills_root.exists():
-        return None
-    # Match either a flat ``<root>/<name>/SKILL.md`` or any nested layout.
-    for skill_md in skills_root.rglob("SKILL.md"):
-        try:
-            rel = skill_md.relative_to(skills_root)
-        except ValueError:
+    """Locate the directory of skill ``name``. Returns None if not found.
+
+    Search order (matches engine.skills.utils.get_all_skills_dirs):
+      1. Writable pool — ``<agent_home>/skills/{custom,installed}``
+      2. Bundled pool — ``<install>/skills-bundle-optional/`` (read-only
+         skills that ship with the installer, e.g. ``powerpoint``).
+      3. External skill dirs from config.
+
+    The writable pool wins on name conflict so a user-tweaked copy of a
+    stock skill overrides the bundled version.
+    """
+    for skills_root in skill_utils.get_all_skills_dirs():
+        if not skills_root.exists():
             continue
-        if rel.parts and rel.parts[0].startswith("."):
-            # Skip .archive, .hub, .git, etc.
-            continue
-        # Try frontmatter `name:` first, then directory name as fallback.
-        # _read_skill_name lives in engine.skills.usage (vendored from
-        # tools/skill_usage.py).
-        frontmatter_name = skill_usage._read_skill_name(  # noqa: SLF001
-            skill_md, fallback=skill_md.parent.name
-        )
-        if frontmatter_name == name or skill_md.parent.name == name:
-            return skill_md.parent
+        # Match either a flat ``<root>/<name>/SKILL.md`` or any nested layout.
+        for skill_md in skills_root.rglob("SKILL.md"):
+            try:
+                rel = skill_md.relative_to(skills_root)
+            except ValueError:
+                continue
+            if rel.parts and rel.parts[0].startswith("."):
+                # Skip .archive, .hub, .git, etc.
+                continue
+            # Try frontmatter `name:` first, then directory name as fallback.
+            # _read_skill_name lives in engine.skills.usage (vendored from
+            # tools/skill_usage.py).
+            frontmatter_name = skill_usage._read_skill_name(  # noqa: SLF001
+                skill_md, fallback=skill_md.parent.name
+            )
+            if frontmatter_name == name or skill_md.parent.name == name:
+                return skill_md.parent
     return None
 
 

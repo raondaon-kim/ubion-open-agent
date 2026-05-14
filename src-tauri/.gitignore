@@ -8,6 +8,12 @@
 # Bundled engine snapshot (copied from ../engine at build time).
 /engine/
 
+# Bundled optional skill pool (mirrored from ../skills-bundle-optional at
+# build time). Same shape as the engine snapshot — checked-in copy lives
+# in the repo root, the build script mirrors it here so Tauri picks it up
+# via bundle.resources.
+/skills-bundle-optional/
+
 # Tauri signing key — NEVER commit (private key for auto-updater).
 /.tauri/
 

@@ -1028,8 +1028,16 @@ def build_skills_system_prompt(
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
-    # produce distinct cache entries (gateway serves multiple platforms).
-    from gateway.session_context import get_session_env
+    # produce distinct cache entries. Upstream Hermes layers a gateway
+    # multi-tenant module on top, but our single-user port doesn't ship
+    # `gateway.session_context` — fall back to env-only when it's
+    # missing so the prompt builder still runs (otherwise the skills
+    # index never makes it into the system prompt).
+    try:
+        from gateway.session_context import get_session_env  # noqa: PLC0415
+    except ImportError:
+        def get_session_env(_key: str) -> str:  # type: ignore[misc]
+            return ""
     _platform_hint = (
         os.environ.get("HERMES_PLATFORM")
         or get_session_env("HERMES_SESSION_PLATFORM")
