@@ -220,13 +220,26 @@ def _summarize_args(args: Dict[str, Any]) -> str:
     return summary
 
 
+# Keys whose values carry the actionable signal of a tool result — when
+# present we prefer to show the value (truncated) rather than just the
+# key name. ``stdout`` / ``stderr`` matter most for shell; ``error`` /
+# ``_warning`` / ``_hint`` matter for everything else (without them we
+# couldn't tell *why* a tool was REFUSED). ``content`` is intentionally
+# left out — it's almost always huge file bodies that drown the log.
+_RESULT_PREVIEW_KEYS = ("stdout", "stderr", "error", "_warning", "_hint", "message")
+_RESULT_PREVIEW_LEN = 200
+
+
 def _summarize_result(value: Any) -> str:
     """One-line preview of a tool result for the DONE log.
 
     JSON-shaped strings (most of our tools return those) are flattened
-    to their top-level keys so the log is greppable. Plain strings get
-    truncated. Falls through to ``type(value).__name__`` for anything
-    else so we never raise from inside the logger.
+    to their top-level keys AND short previews of the signal-bearing
+    keys (stdout/stderr/error/_warning) so server.log shows *why* a
+    tool failed without the user having to enable tool-call replay.
+    Plain strings get truncated. Falls through to
+    ``type(value).__name__`` for anything else so we never raise from
+    inside the logger.
     """
     try:
         if isinstance(value, str):
@@ -239,7 +252,27 @@ def _summarize_result(value: Any) -> str:
                 if isinstance(parsed, dict):
                     keys = list(parsed)[:6]
                     extra = "" if len(parsed) <= 6 else f", ...{len(parsed)-6} more"
-                    return f"dict({', '.join(keys)}{extra})"
+                    head = f"dict({', '.join(keys)}{extra})"
+                    # Pull in short previews of the keys that actually
+                    # carry diagnostic signal. ``stdout`` first, then
+                    # the error/warning family. Multiple matches get
+                    # concatenated so a shell call that printed to
+                    # both stdout and stderr is visible at a glance.
+                    extras: list[str] = []
+                    for key in _RESULT_PREVIEW_KEYS:
+                        if key not in parsed:
+                            continue
+                        raw_val = parsed[key]
+                        if raw_val is None or raw_val == "":
+                            continue
+                        text = raw_val if isinstance(raw_val, str) else repr(raw_val)
+                        text = text.replace("\n", "\\n").replace("\r", "\\r")
+                        if len(text) > _RESULT_PREVIEW_LEN:
+                            text = text[:_RESULT_PREVIEW_LEN - 3] + "..."
+                        extras.append(f"{key}={text!r}")
+                    if extras:
+                        return head + " " + " ".join(extras)
+                    return head
                 if isinstance(parsed, list):
                     return f"list(len={len(parsed)})"
             return repr(stripped[:120]) + ("..." if len(stripped) > 120 else "")

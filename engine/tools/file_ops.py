@@ -247,6 +247,275 @@ def append_workspace_file(path: str, content: str, *, binary_b64: bool = False) 
     )
 
 
+def patch_file(
+    path: str,
+    old_string: str,
+    new_string: str,
+    *,
+    replace_all: bool = False,
+) -> str:
+    """Tool handler — replace ``old_string`` with ``new_string`` in a file.
+
+    Why this exists: Hermes' patch tool routed through a sandbox shell
+    backend (``tools.terminal_tool``) we never vendored, so every call
+    died at import time. Six consecutive failures in one session told
+    us the model couldn't tell the tool was structurally dead — it
+    just kept retrying. This native rewrite is ~50 lines, no shell,
+    and matches the workspace policy expected by the rest of file_ops.
+
+    Matching:
+      - Exact byte match first (Anthropic's contract for "old_string").
+      - If no exact match, try whitespace-tolerant match
+        (collapse all whitespace runs to a single space) — common
+        failure mode is the model paraphrasing indentation/newlines.
+      - Still no match → return error WITH the closest candidate
+        line from difflib so the model can re-target instead of
+        retrying the same broken anchor.
+
+    Policy:
+      - Path must already exist (creation is for write_file /
+        create_workspace_file).
+      - Writes inside workspace are REFUSED — workspace stays
+        create-only by user policy. Use this tool to edit files
+        under agent_home (scripts, references, scratch).
+      - Reads (the pre-patch read) are allowed anywhere so the
+        model can patch files that live elsewhere if the caller
+        explicitly placed them outside both roots — but the write
+        only goes back if the file is inside agent_home.
+    """
+    if not path or not isinstance(path, str):
+        return tool_error("missing or invalid 'path'")
+    if has_traversal_component(path):
+        return tool_error("path contains '..' traversal — refused")
+    if old_string is None or new_string is None:
+        return tool_error("both 'old_string' and 'new_string' are required")
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        target = (get_hermes_home() / path).resolve()
+    if not target.exists():
+        return tool_error(f"path does not exist: {target}")
+    if not target.is_file():
+        return tool_error(f"not a regular file: {target}")
+    workspace = get_workspace()
+    try:
+        target_resolved = target.resolve()
+        workspace_resolved = workspace.resolve()
+    except OSError as exc:
+        return tool_error(f"cannot resolve paths: {exc}")
+    try:
+        target_resolved.relative_to(workspace_resolved)
+        in_workspace = True
+    except ValueError:
+        in_workspace = False
+    if in_workspace:
+        return tool_error(
+            f"refusing to patch workspace file {target}. Workspace is "
+            "create-only by policy — make a new file with "
+            "create_workspace_file instead of modifying existing ones."
+        )
+    try:
+        original = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return tool_error(f"cannot read {target}: {exc}")
+    # ── Pass 1: exact match ──────────────────────────────────────
+    exact_count = original.count(old_string)
+    if exact_count > 0:
+        if exact_count > 1 and not replace_all:
+            return tool_error(
+                f"old_string matched {exact_count} times in {target}; "
+                "either pass replace_all=true or give a longer/more "
+                "unique anchor."
+            )
+        new_content = (
+            original.replace(old_string, new_string)
+            if replace_all
+            else original.replace(old_string, new_string, 1)
+        )
+        match_mode = "exact"
+        match_count = exact_count if replace_all else 1
+    else:
+        # ── Pass 2: line-aligned whitespace-tolerant match ─────────
+        # Model paraphrasing usually hits indentation / trailing
+        # whitespace within a line, not across newlines. Match
+        # line-by-line so we never merge two distinct lines into
+        # one window (the bug a naive \\s+ collapse hits, which
+        # silently fuses ``alpha\\nbeta`` into ``alpha beta``).
+        import re as _re
+        inline_ws = _re.compile(r"[ \t]+")
+        def _norm_line(s: str) -> str:
+            return inline_ws.sub(" ", s).strip()
+        old_lines = old_string.splitlines()
+        # Drop trailing blank lines from the anchor so a missing
+        # final newline doesn't ruin the match. Keep internal
+        # blank lines — they're meaningful structure.
+        while old_lines and not old_lines[-1].strip():
+            old_lines.pop()
+        if not old_lines:
+            return tool_error(
+                f"old_string contains only whitespace — provide a "
+                "non-empty anchor."
+            )
+        norm_anchor = [_norm_line(ln) for ln in old_lines]
+        # Walk original line-by-line. ``splitlines(keepends=True)``
+        # preserves the newline characters so byte spans are
+        # exact for re-assembly.
+        original_lines = original.splitlines(keepends=True)
+        positions: list[tuple[int, int]] = []
+        offsets: list[int] = [0]
+        for ln in original_lines:
+            offsets.append(offsets[-1] + len(ln))
+        i = 0
+        while i <= len(original_lines) - len(norm_anchor):
+            window = [_norm_line(original_lines[i + j]) for j in range(len(norm_anchor))]
+            if window == norm_anchor:
+                start = offsets[i]
+                end = offsets[i + len(norm_anchor)]
+                positions.append((start, end))
+                i += len(norm_anchor)
+            else:
+                i += 1
+        if not positions:
+            # ── Pass 3: no match anywhere → give the model a hint
+            # built from the closest line so it can re-anchor.
+            import difflib
+            haystack_lines = original.splitlines()
+            first_old_line = old_string.splitlines()[0].strip() if old_string.strip() else ""
+            close = (
+                difflib.get_close_matches(first_old_line, haystack_lines, n=3, cutoff=0.5)
+                if first_old_line
+                else []
+            )
+            hint = ""
+            if close:
+                hint = "\nClosest lines in file:\n" + "\n".join(
+                    f"  • {ln[:120]}" for ln in close
+                )
+            return tool_error(
+                f"old_string not found in {target} (tried exact + "
+                f"whitespace-tolerant match).{hint}\nUse read_file to "
+                "verify current content before retrying."
+            )
+        if len(positions) > 1 and not replace_all:
+            return tool_error(
+                f"old_string matched {len(positions)} times via "
+                "whitespace-tolerant match; pass replace_all=true or "
+                "give a more unique anchor."
+            )
+        # Line-aligned spans always end at a newline boundary. If the
+        # model's ``new_string`` doesn't end with one, the next line
+        # after the patch gets glued onto the last replaced line.
+        # Auto-append a newline whenever the original span ended with
+        # one and the replacement doesn't.
+        effective_new = new_string
+        if positions and original[positions[0][1] - 1:positions[0][1]] == "\n" \
+                and not effective_new.endswith("\n"):
+            effective_new = effective_new + "\n"
+        # Apply replacements right-to-left so earlier offsets stay valid.
+        new_content = original
+        targets = positions if replace_all else positions[:1]
+        for start, end in reversed(targets):
+            new_content = new_content[:start] + effective_new + new_content[end:]
+        match_mode = "whitespace-tolerant"
+        match_count = len(targets)
+    # ── Write back ───────────────────────────────────────────────
+    try:
+        target.write_text(new_content, encoding="utf-8")
+    except OSError as exc:
+        return tool_error(f"cannot write {target}: {exc}")
+    delta = len(new_content) - len(original)
+    logger.info(
+        "patch_file: PATCHED %s (match=%s count=%d Δ=%+d bytes)",
+        target, match_mode, match_count, delta,
+    )
+    return tool_result(
+        path=str(target),
+        match_mode=match_mode,
+        replacements=match_count,
+        bytes_before=len(original.encode("utf-8")),
+        bytes_after=len(new_content.encode("utf-8")),
+    )
+
+
+def search_files(
+    pattern: str,
+    path: str = ".",
+    *,
+    file_glob: str | None = None,
+    limit: int = 50,
+    case_insensitive: bool = False,
+) -> str:
+    """Tool handler — grep for a regex across text files under ``path``.
+
+    Pure-Python replacement for the Hermes ``search_files`` that died
+    on the missing ``tools.terminal_tool`` import. Scans up to ``limit``
+    matches and returns them as ``{path, line, text}`` records.
+    """
+    if not pattern or not isinstance(pattern, str):
+        return tool_error("missing or invalid 'pattern'")
+    resolved = _resolve_for_read(path or ".")
+    if isinstance(resolved, str):
+        return tool_error(resolved)
+    if not resolved.exists():
+        return tool_error(f"path does not exist: {path!r}")
+    import re as _re
+    try:
+        flags = _re.IGNORECASE if case_insensitive else 0
+        regex = _re.compile(pattern, flags)
+    except _re.error as exc:
+        return tool_error(f"invalid regex {pattern!r}: {exc}")
+    # Default glob keeps the search to reasonable text files so we
+    # don't spend minutes scanning node_modules / .venv / __pycache__
+    # binaries on a bare directory call. The model can still override
+    # with file_glob='*' to opt back in.
+    if file_glob:
+        candidate_iter = resolved.rglob(file_glob) if resolved.is_dir() else [resolved]
+    elif resolved.is_dir():
+        text_exts = (".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".txt", ".json",
+                     ".yaml", ".yml", ".toml", ".rs", ".go", ".java", ".kt",
+                     ".cs", ".html", ".css", ".sh", ".ps1")
+        candidate_iter = (
+            p for p in resolved.rglob("*")
+            if p.is_file() and p.suffix.lower() in text_exts
+        )
+    else:
+        candidate_iter = [resolved]
+    matches: list[dict] = []
+    skip_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__",
+                 ".pytest_cache", "target", "dist", "build"}
+    for fp in candidate_iter:
+        if any(part in skip_dirs for part in fp.parts):
+            continue
+        if not fp.is_file():
+            continue
+        try:
+            with fp.open("r", encoding="utf-8", errors="replace") as fh:
+                for lineno, line in enumerate(fh, start=1):
+                    if regex.search(line):
+                        matches.append({
+                            "path": str(fp),
+                            "line": lineno,
+                            "text": line.rstrip("\n")[:300],
+                        })
+                        if len(matches) >= limit:
+                            break
+        except OSError:
+            continue
+        if len(matches) >= limit:
+            break
+    truncated = len(matches) >= limit
+    logger.info(
+        "search_files: pattern=%r path=%s matches=%d%s",
+        pattern, resolved, len(matches), " (truncated)" if truncated else "",
+    )
+    return tool_result(
+        pattern=pattern,
+        path=str(resolved),
+        matches=matches,
+        match_count=len(matches),
+        truncated=truncated,
+    )
+
+
 def list_files(path: str = ".") -> str:
     """Tool handler — list files in a directory."""
     resolved = _resolve_for_read(path or ".")
@@ -431,6 +700,101 @@ def build_default_file_tools() -> "list[Tool]":
                 (args or {}).get("path", ""),
                 (args or {}).get("content", ""),
                 binary_b64=bool((args or {}).get("binary_b64", False)),
+            ),
+        ),
+        Tool(
+            name="patch",
+            description=(
+                "Replace `old_string` with `new_string` in an existing file. "
+                "Tries exact match first, then a whitespace-tolerant match "
+                "(handles indentation/newline drift). On no match, returns "
+                "the closest line as a hint so you can re-target. Use this "
+                "instead of read_file + write_file when changing a small "
+                "piece of a file. Workspace files are REFUSED by policy "
+                "(workspace is create-only); use this on files under the "
+                "agent home (your scripts, references, scratch)."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the file. Relative is resolved under "
+                            "the agent home; absolute is used as-is."
+                        ),
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Text to find. Must be unique unless replace_all=true.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Text to replace `old_string` with.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every match instead of just the first.",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+            handler=lambda args: patch_file(
+                (args or {}).get("path", ""),
+                (args or {}).get("old_string", ""),
+                (args or {}).get("new_string", ""),
+                replace_all=bool((args or {}).get("replace_all", False)),
+            ),
+        ),
+        Tool(
+            name="search_files",
+            description=(
+                "Grep for a regex across text files. Returns up to `limit` "
+                "matches as {path, line, text} records. Defaults to text "
+                "file extensions (.py/.md/.json/.js/.ts/...) when path is "
+                "a directory; override with file_glob to search anything. "
+                "Skips common heavy dirs (node_modules, .venv, target, "
+                "__pycache__) automatically."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Python-flavored regex to match.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search (default '.').",
+                        "default": ".",
+                    },
+                    "file_glob": {
+                        "type": "string",
+                        "description": (
+                            "Optional rglob pattern (e.g. '*.py'). When "
+                            "omitted, restricts to common text extensions."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Stop after this many matches (default 50).",
+                        "default": 50,
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "Case-insensitive matching.",
+                        "default": False,
+                    },
+                },
+                "required": ["pattern"],
+            },
+            handler=lambda args: search_files(
+                (args or {}).get("pattern", ""),
+                (args or {}).get("path", ".") or ".",
+                file_glob=(args or {}).get("file_glob"),
+                limit=int((args or {}).get("limit", 50) or 50),
+                case_insensitive=bool((args or {}).get("case_insensitive", False)),
             ),
         ),
     ]
