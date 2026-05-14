@@ -857,6 +857,44 @@ class AIAgent:
                 self._emit_progress("final_text", {"text": response.text})
                 return
 
+            # ── Truncation guard: when stop_reason == "length" the model
+            # hit max_tokens mid-output. If it was mid-tool_call, the
+            # arguments JSON is incomplete — the LiteLLM client falls
+            # back to args={} and we end up dispatching the tool with
+            # empty inputs (write_file(path=''), create_workspace_file()
+            # — both REFUSED, then the model retries and truncates
+            # again, indefinitely). Drop the tool_calls, append a guidance
+            # message, and let the next turn re-plan with smaller payloads.
+            if response.stop_reason == "length" and response.tool_calls:
+                depth = getattr(self, "_delegate_depth", 0)
+                depth_tag = f"[d={depth}] " if depth else ""
+                logger.warning(
+                    "%sturn %d: response truncated (stop=length) with %d tool_call(s) — "
+                    "dropping incomplete calls and asking model to retry with smaller payloads",
+                    depth_tag, api_call_count, len(response.tool_calls),
+                )
+                # Record what the model attempted as plain text so the
+                # transcript stays readable, then add a user-role nudge.
+                truncated_names = ", ".join(tc.name for tc in response.tool_calls) or "?"
+                messages.append({
+                    "role": "assistant",
+                    "content": (response.text or "")
+                    + f"\n\n[truncated: attempted {truncated_names} but ran out of tokens]",
+                })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was cut off because it exceeded the output "
+                        "token limit. The tool call arguments did not arrive in full and "
+                        "have been discarded. Retry with a smaller payload — for write_file "
+                        "/ create_workspace_file with large content, split into multiple "
+                        "smaller calls using append_file for subsequent chunks, or generate "
+                        "the file with a script via the shell tool instead of inlining its "
+                        "body. Plan your next step before producing it."
+                    ),
+                })
+                continue
+
             # ── Interrupt check #2 — between LLM and tool dispatch ───────
             # The model already produced tool_calls; we *could* drop them,
             # but appending the assistant turn first keeps the transcript

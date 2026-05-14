@@ -181,6 +181,72 @@ def create_workspace_file(path: str, content: str, *, binary_b64: bool = False) 
     )
 
 
+def append_workspace_file(path: str, content: str, *, binary_b64: bool = False) -> str:
+    """Append text/bytes to an existing workspace file the agent created
+    earlier in this same conversation.
+
+    Why this exists: max_tokens caps each LLM turn at ~16K tokens. A full
+    PPTX/HTML/markdown body often blows past that on a single
+    ``create_workspace_file`` call, so the JSON arguments arrive truncated
+    and the file write silently fails. ``append_file`` lets the model
+    seed the file with a small first chunk and then top it up across
+    multiple turns — each chunk well under the per-call cap.
+
+    Policy: the target must already exist inside the workspace (i.e.
+    created by an earlier ``create_workspace_file``). We do NOT let the
+    agent append to arbitrary user-owned files — that would silently
+    modify pre-existing content and break the workspace's create-only
+    invariant.
+    """
+    if not path or not isinstance(path, str):
+        return tool_error("missing or invalid 'path'")
+    if has_traversal_component(path):
+        return tool_error("path contains '..' traversal — refused")
+    workspace = get_workspace()
+    candidate = (workspace / path) if not Path(path).is_absolute() else Path(path)
+    err = validate_within_dir(candidate, workspace)
+    if err:
+        return tool_error(err)
+    if not candidate.exists():
+        return tool_error(
+            f"append target does not exist: {candidate}. Use create_workspace_file "
+            "for the first chunk; append_file is only for topping up a file you "
+            "already created in this session."
+        )
+    if not candidate.is_file():
+        return tool_error(f"append target is not a regular file: {candidate}")
+    if content is None:
+        return tool_error("missing 'content'")
+    try:
+        if binary_b64:
+            import base64
+            try:
+                data = base64.b64decode(content, validate=True)
+            except Exception as exc:
+                return tool_error(f"content is not valid base64: {exc}")
+            with candidate.open("ab") as fp:
+                fp.write(data)
+            written = len(data)
+        else:
+            with candidate.open("a", encoding="utf-8") as fp:
+                fp.write(content)
+            written = len(content.encode("utf-8"))
+    except OSError as exc:
+        logger.warning("append_workspace_file: write failed %s: %s", candidate, exc)
+        return tool_error(f"cannot append to {path!r}: {exc}")
+    new_size = candidate.stat().st_size
+    logger.info(
+        "append_workspace_file: APPENDED %s (+%d bytes, total=%d%s)",
+        candidate, written, new_size, ", binary" if binary_b64 else "",
+    )
+    return tool_result(
+        path=str(candidate),
+        bytes_appended=written,
+        total_size=new_size,
+        binary=binary_b64,
+    )
+
+
 def list_files(path: str = ".") -> str:
     """Tool handler — list files in a directory."""
     resolved = _resolve_for_read(path or ".")
@@ -316,6 +382,52 @@ def build_default_file_tools() -> "list[Tool]":
                 "required": ["path", "content"],
             },
             handler=lambda args: create_workspace_file(
+                (args or {}).get("path", ""),
+                (args or {}).get("content", ""),
+                binary_b64=bool((args or {}).get("binary_b64", False)),
+            ),
+        ),
+        Tool(
+            name="append_file",
+            description=(
+                "Append text or bytes to a workspace file you ALREADY created "
+                "in this session with create_workspace_file. Use when a single "
+                "create call would exceed the per-response token budget — "
+                "seed with create_workspace_file, then top up with one or more "
+                "append_file calls. Refuses to create new files (use "
+                "create_workspace_file for that) and refuses to touch files "
+                "you didn't create (workspace stays create-only by policy). "
+                "Set binary_b64=true to append base64-decoded bytes."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path of the file to append to. Must already "
+                            "exist inside UBION_WORKSPACE."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Text to append, OR base64-encoded bytes when "
+                            "binary_b64=true."
+                        ),
+                    },
+                    "binary_b64": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, decode `content` from base64 and "
+                            "append raw bytes."
+                        ),
+                        "default": False,
+                    },
+                },
+                "required": ["path", "content"],
+            },
+            handler=lambda args: append_workspace_file(
                 (args or {}).get("path", ""),
                 (args or {}).get("content", ""),
                 binary_b64=bool((args or {}).get("binary_b64", False)),

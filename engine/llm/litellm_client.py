@@ -58,7 +58,13 @@ from engine.llm.deepseek import (
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MAX_TOKENS = 4096
+# Output ceiling per request. 4096 was the original — observed truncation
+# (stop_reason=length) when the model tries to dump a full PPTX body or a
+# long write_file content arg in one shot, which made tool_calls arrive
+# with mid-JSON cut-offs and empty arguments after the JSON parse failed.
+# 16384 fits Claude Sonnet / Opus and DeepSeek v4 flash; if a particular
+# proxy capping requires smaller, override with LITELLM_MAX_TOKENS.
+DEFAULT_MAX_TOKENS = int(os.environ.get("LITELLM_MAX_TOKENS", "16384"))
 # Hard ceiling for one streaming request. Hit when the proxy keeps a
 # connection open but stops emitting chunks — without it the agent
 # loop hangs and the UI looks frozen.

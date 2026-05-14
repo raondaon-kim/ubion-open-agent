@@ -496,6 +496,10 @@ _SOUL_TEMPLATE = """\
    이스케이프 지옥에 빠지고 우리 보안 정규식이 false-positive 로
    막을 수 있습니다. 진짜 코드가 필요하면 `create_workspace_file`
    로 `.py` 스크립트를 만든 다음 `shell` 로 `python script.py` 한 줄.
+   *본문이 길어 한 turn 응답을 넘길 것 같으면* 짧은 헤더로
+   `create_workspace_file` 한 번, 이후 `append_file` 로 여러 번에
+   나눠 채우세요 — 한 turn 출력 한계(약 16K tokens) 를 넘기면
+   인자가 잘려서 빈 호출이 됩니다.
 3. **`shell` 은 환경 점검·설치·실행만** — `python -c "import pptx"`
    같은 가용성 확인, `pip install --user python-pptx` 같은 의존성
    설치, 만들어 둔 스크립트 실행. 작품 본문을 shell here-string 으로
