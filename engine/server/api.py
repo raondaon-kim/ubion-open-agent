@@ -42,7 +42,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from engine.core.agent import AIAgent
-from engine.storage.agent_home import get_workspace
+from engine.storage.agent_home import get_workspace, set_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,10 @@ class FsListResponse(BaseModel):
 
 class WorkspaceResponse(BaseModel):
     workspace: str
+
+
+class WorkspaceUpdateRequest(BaseModel):
+    path: str
 
 
 class SkillBundleInfo(BaseModel):
@@ -316,6 +320,144 @@ def _sse_chunk(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+async def _stream_with_progress(
+    *,
+    agent: Any,
+    user_message: str,
+    history: List[Dict[str, Any]],
+    request_id: str,
+    model: str,
+) -> AsyncGenerator[str, None]:
+    """Stream real AIAgent progress events as SSE.
+
+    The agent loop runs in a worker thread; its ``progress_callback``
+    pushes events onto an ``asyncio.Queue``. We drain the queue here,
+    convert each event into the OpenAI-compatible chunk shape (so the
+    web client's existing SSE parser keeps working), and finally emit
+    the assistant's full text once the loop finishes.
+
+    Event → SSE chunk shape:
+
+        * ``llm_call_started``   → progress chunk with ``stage: "thinking"``
+        * ``tool_call_started``  → progress chunk with ``stage: "tool"``,
+                                   ``tool_name``
+        * ``tool_call_finished`` → progress chunk with ``stage: "tool_done"``
+        * ``final_text``         → real content delta (sliced)
+        * ``done``               → ``finish_reason`` + ``[DONE]``
+
+    All progress chunks carry an ``ubion`` namespaced object so OpenAI-
+    only clients ignore them and only see the final text deltas.
+    """
+    created = int(time.time())
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _on_event(event_type: str, payload: Dict[str, Any]) -> None:
+        # AIAgent runs on a worker thread, so we have to hop back onto
+        # the event loop to safely enqueue.
+        loop.call_soon_threadsafe(queue.put_nowait, (event_type, payload))
+
+    # Kick the agent off on a worker thread; we don't await this — the
+    # result still lands via the `done` event.
+    fut = asyncio.create_task(
+        asyncio.to_thread(
+            agent.run_conversation,
+            user_message=user_message,
+            conversation_history=history or None,
+            progress_callback=_on_event,
+        )
+    )
+
+    # Initial role chunk so the client knows the assistant turn started.
+    yield _sse_chunk({
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": ""},
+            "finish_reason": None,
+        }],
+    })
+
+    final_text = ""
+    finish_reason = "stop"
+    while True:
+        event_type, payload = await queue.get()
+
+        if event_type == "final_text":
+            final_text = payload.get("text", "") or ""
+            chunk_size = 50
+            for i in range(0, len(final_text), chunk_size):
+                yield _sse_chunk({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": final_text[i:i + chunk_size]},
+                        "finish_reason": None,
+                    }],
+                })
+                await asyncio.sleep(0)
+            continue
+
+        if event_type == "done":
+            if payload.get("exit_reason") not in (None, "completed"):
+                finish_reason = "length"
+            break
+
+        # Progress (thinking / tool) — carried in a side-channel object
+        # so OpenAI-only clients can ignore it.
+        stage_map = {
+            "llm_call_started":   "thinking",
+            "tool_call_started":  "tool",
+            "tool_call_finished": "tool_done",
+        }
+        stage = stage_map.get(event_type)
+        if stage is None:
+            continue
+        yield _sse_chunk({
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": None,
+            }],
+            "ubion": {
+                "stage": stage,
+                "tool_name": payload.get("name"),
+                "ok": payload.get("ok"),
+                "turn": payload.get("turn"),
+            },
+        })
+
+    # Make sure the worker future finishes (cleans up the thread).
+    try:
+        await fut
+    except Exception:
+        # Errors are already surfaced via the `done` event's payload.
+        pass
+
+    yield _sse_chunk({
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish_reason,
+        }],
+    })
+    yield "data: [DONE]\n\n"
+
+
 async def _stream_chat_completion(
     request_id: str,
     model: str,
@@ -456,6 +598,49 @@ def create_app() -> FastAPI:
     async def health() -> Dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/v1/ubion/debug/info")
+    async def debug_info(_: None = Depends(_require_bearer)) -> Dict[str, Any]:
+        """Surface enough state for the Debug drawer to help a user
+        (or developer) understand *why* something went wrong: which keys
+        are loaded, where logs live, current backend version + agent home.
+        Secrets are never echoed back — only their presence.
+        """
+        from engine.storage.agent_home import get_hermes_home, get_workspace
+        home = get_hermes_home()
+        return {
+            "agent_home": str(home),
+            "workspace": str(get_workspace()),
+            "log_file": str(home / "logs" / "server.log"),
+            "soul_md_exists": (home / "SOUL.md").exists(),
+            "user_md_exists": (home / "USER.md").exists(),
+            "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "deepseek_key_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
+            "idle_timeout_s": int(os.environ.get("UBION_IDLE_TIMEOUT_S", "1800") or 0),
+        }
+
+    @app.get("/v1/ubion/debug/log")
+    async def debug_log(
+        tail: int = 200,
+        _: None = Depends(_require_bearer),
+    ) -> Dict[str, Any]:
+        """Return the last ``tail`` lines of the rotating server log so
+        the Debug drawer can show them without the user shelling out to
+        find ``%LOCALAPPDATA%\\.ubion-agent\\logs\\server.log``."""
+        from engine.storage.agent_home import get_hermes_home
+        log_path = get_hermes_home() / "logs" / "server.log"
+        if not log_path.exists():
+            return {"path": str(log_path), "lines": []}
+        try:
+            with log_path.open(encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        n = max(1, min(int(tail) or 200, 2000))
+        return {
+            "path": str(log_path),
+            "lines": [line.rstrip("\n") for line in lines[-n:]],
+        }
+
     @app.get("/v1/ubion/fs/list", response_model=FsListResponse)
     async def fs_list(
         path: Optional[str] = None,
@@ -488,6 +673,30 @@ def create_app() -> FastAPI:
         instead of always defaulting to the home folder.
         """
         return WorkspaceResponse(workspace=str(get_workspace()))
+
+    @app.post("/v1/ubion/workspace", response_model=WorkspaceResponse)
+    async def set_workspace_endpoint(
+        body: WorkspaceUpdateRequest,
+        _: None = Depends(_require_bearer),
+    ) -> WorkspaceResponse:
+        """Persist a new workspace folder.
+
+        Writes UBION_WORKSPACE into ``agent_home/.env`` AND updates
+        ``os.environ`` so the change applies immediately to the next
+        chat turn without restarting the server. Returns the resolved
+        path the agent will use.
+
+        Errors:
+          * 400 — path empty / not absolute / not creatable
+        """
+        try:
+            resolved = set_workspace(body.path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"could not create workspace: {exc}")
+        logger.info("workspace updated to %s", resolved)
+        return WorkspaceResponse(workspace=str(resolved))
 
     @app.get("/v1/ubion/skills/bundle/info", response_model=SkillBundleInfo)
     async def skills_bundle_info(
@@ -588,24 +797,27 @@ def create_app() -> FastAPI:
         user_message = _to_user_message(req.messages)
         history = _to_conversation_history(req.messages)
         agent = _agent_factory(req.model)
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
-        # Run the synchronous loop in a worker thread so the FastAPI
-        # event loop stays responsive while AIAgent does its API calls.
+        if req.stream:
+            return StreamingResponse(
+                _stream_with_progress(
+                    agent=agent,
+                    user_message=user_message,
+                    history=history,
+                    request_id=request_id,
+                    model=req.model,
+                ),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming: just run synchronously and return the full result.
         result = await asyncio.to_thread(
             agent.run_conversation,
             user_message=user_message,
             conversation_history=history or None,
         )
-
         text = result.get("final_response", "") or ""
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-
-        if req.stream:
-            return StreamingResponse(
-                _stream_chat_completion(request_id, req.model, text),
-                media_type="text/event-stream",
-            )
-
         return ChatCompletionResponse(
             id=request_id,
             created=int(time.time()),

@@ -6,6 +6,13 @@
 *.env.local
 **/.env
 
+# Installer-bundled secrets: engine/.env.bundled ships the internal
+# LiteLLM proxy credentials. It is copied to the user's agent_home on
+# first boot. NEVER commit a populated copy — the file lives only in
+# the developer's working tree.
+engine/.env.bundled
+**/.env.bundled
+
 # Tauri auto-updater signing key (private). The .pub counterpart is
 # embedded in tauri.conf.json and is fine to commit.
 src-tauri/.tauri/

@@ -30,7 +30,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from engine.llm.anthropic import AnthropicClient, ChatResponse
+from engine.llm.anthropic import ChatResponse
+from engine.llm.router import build_client
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,16 @@ def call_llm(
     system_text, plain_messages = _split_system(messages)
     plain_messages = _coerce_messages(plain_messages)
 
-    client = AnthropicClient(api_key=api_key, model=chosen_model, base_url=base_url)
+    # Phase 1 Unit 13: route through the shared LLM router so LiteLLM-
+    # proxy environments compress through the same endpoint as the main
+    # agent loop. Falls back to the Anthropic path when LiteLLM env
+    # vars are absent — same surface either way.
+    client = build_client(
+        model=chosen_model,
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
+    )
     chat_response: ChatResponse = client.chat(
         messages=plain_messages,
         system=system_text,

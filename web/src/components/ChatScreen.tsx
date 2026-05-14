@@ -11,11 +11,15 @@ import type { Message, ModelInfo, Panel } from "../types";
 import { SkillPanel } from "./SkillPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { SettingsPanel } from "./SettingsPanel";
+import type { DebugEvent } from "./DebugDrawer";
+import { formatProgressForDebug } from "./DebugDrawer";
 
 interface Props {
   panel: Panel;
   currentId: string | null;
   onConversationSaved: (meta: ConversationMeta) => void;
+  onDebugEvent: (ev: Omit<DebugEvent, "ts"> & { ts?: number }) => void;
+  onToggleDebug: () => void;
 }
 
 const SUGGESTED = [
@@ -24,7 +28,7 @@ const SUGGESTED = [
   { title: "비유를 다섯 개만 만들어줘", subtitle: "주제: 비 오는 도시" },
 ];
 
-export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
+export function ChatScreen({ panel, currentId, onConversationSaved, onDebugEvent, onToggleDebug }: Props) {
   const { theme, toggle } = useTheme();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -118,6 +122,7 @@ export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
     const abort = new AbortController();
     abortRef.current = abort;
 
+    onDebugEvent({ kind: "request", text: `send → ${model} (${text.length} chars)` });
     try {
       await streamChatCompletion({
         model,
@@ -126,11 +131,58 @@ export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
           .map((m) => ({ role: m.role, content: m.content })),
         signal: abort.signal,
         onDelta: (delta) => {
+          // Debug: 첫 delta 시점만 별도 표시, 이후는 노이즈라 생략
+          onDebugEvent({ kind: "delta", text: `+${delta.length} chars` });
           setMessages((prev) => {
             const copy = prev.slice();
             const last = copy[copy.length - 1];
             if (last && last.role === "assistant") {
-              copy[copy.length - 1] = { ...last, content: last.content + delta };
+              // 첫 텍스트 delta 가 도착했다면 progress 단계는 끝
+              copy[copy.length - 1] = {
+                ...last,
+                content: last.content + delta,
+                progress: undefined,
+              };
+            }
+            return copy;
+          });
+        },
+        onProgress: (event) => {
+          onDebugEvent({ kind: "progress", text: formatProgressForDebug(event), detail: event });
+          setMessages((prev) => {
+            const copy = prev.slice();
+            const last = copy[copy.length - 1];
+            if (!last || last.role !== "assistant") return prev;
+            const prevProgress = last.progress;
+            const completed = prevProgress?.toolsCompleted ?? 0;
+            if (event.stage === "thinking") {
+              copy[copy.length - 1] = {
+                ...last,
+                progress: {
+                  stage: "thinking",
+                  startedAt: Date.now(),
+                  toolsCompleted: completed,
+                },
+              };
+            } else if (event.stage === "tool") {
+              copy[copy.length - 1] = {
+                ...last,
+                progress: {
+                  stage: "tool",
+                  toolName: event.toolName,
+                  startedAt: Date.now(),
+                  toolsCompleted: completed,
+                },
+              };
+            } else if (event.stage === "tool_done") {
+              copy[copy.length - 1] = {
+                ...last,
+                progress: {
+                  stage: "thinking",
+                  startedAt: Date.now(),
+                  toolsCompleted: completed + 1,
+                },
+              };
             }
             return copy;
           });
@@ -140,7 +192,7 @@ export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
       setMessages((prev) => {
         const copy = prev.slice();
         const last = copy[copy.length - 1];
-        if (last) copy[copy.length - 1] = { ...last, streaming: false };
+        if (last) copy[copy.length - 1] = { ...last, streaming: false, progress: undefined };
         finalMessages = copy;
         return copy;
       });
@@ -160,6 +212,7 @@ export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
         // 저장 실패는 대화 흐름을 막지 않는다 — 다음 턴에 다시 시도됨
       }
     } catch (err) {
+      onDebugEvent({ kind: "error", text: (err as Error).message, detail: err });
       setMessages((prev) => {
         const copy = prev.slice();
         const last = copy[copy.length - 1];
@@ -168,6 +221,7 @@ export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
             ...last,
             content: last.content || `[오류] ${(err as Error).message}`,
             streaming: false,
+            progress: undefined,
           };
         }
         return copy;
@@ -241,6 +295,17 @@ export function ChatScreen({ panel, currentId, onConversationSaved }: Props) {
         )}
 
         <div className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onToggleDebug}
+            className="w-8 h-8 rounded-md flex items-center justify-center text-sm"
+            style={{ color: "var(--color-text-muted)" }}
+            title="디버그 (Ctrl+Shift+D)"
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-bg-hover)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            ⚙
+          </button>
           <button
             type="button"
             onClick={toggle}
@@ -408,19 +473,55 @@ function MessageBubble({ message }: { message: Message }) {
           U
         </div>
       )}
-      <div
-        className="px-4 py-2.5 rounded-2xl max-w-[80%] whitespace-pre-wrap text-[15px] leading-relaxed"
-        style={
-          isUser
-            ? { background: "var(--color-accent)", color: "white" }
-            : { background: "var(--color-bg-card)", color: "var(--color-text)" }
-        }
-      >
-        {message.content || (message.streaming ? "…" : "")}
-        {message.streaming && message.content && (
-          <span className="inline-block w-1.5 h-4 ml-0.5 animate-pulse" style={{ background: "var(--color-text-muted)" }} />
+      <div className="flex flex-col gap-1 max-w-[80%]">
+        {/* progress hint — 응답 작성 중에 본문이 비어 있을 때만 */}
+        {!isUser && message.streaming && !message.content && message.progress && (
+          <ProgressHint progress={message.progress} />
         )}
+        <div
+          className="px-4 py-2.5 rounded-2xl whitespace-pre-wrap text-[15px] leading-relaxed"
+          style={
+            isUser
+              ? { background: "var(--color-accent)", color: "white" }
+              : { background: "var(--color-bg-card)", color: "var(--color-text)" }
+          }
+        >
+          {message.content || (message.streaming ? "…" : "")}
+          {message.streaming && message.content && (
+            <span className="inline-block w-1.5 h-4 ml-0.5 animate-pulse" style={{ background: "var(--color-text-muted)" }} />
+          )}
+        </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * "생각하는 중 (3s)" / "도구 실행: file_ops (5s)" 같은 진행 상태 줄.
+ *
+ * 1초마다 리렌더해 경과 시간을 갱신한다. busy 상태가 풀리면 부모가
+ * 이 컴포넌트를 unmount 하므로 타이머 정리만 신경 쓰면 된다.
+ */
+function ProgressHint({ progress }: { progress: NonNullable<Message["progress"]> }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsed = Math.max(0, Math.floor((now - progress.startedAt) / 1000));
+  const label = progress.stage === "tool"
+    ? `도구 실행: ${progress.toolName ?? "?"}`
+    : "생각하는 중";
+  const completedSuffix = progress.toolsCompleted
+    ? ` · 도구 ${progress.toolsCompleted}회 완료`
+    : "";
+  return (
+    <div
+      className="text-xs px-3 py-1 rounded-full inline-flex items-center gap-2 self-start"
+      style={{ background: "var(--color-bg-hover)", color: "var(--color-text-muted)" }}
+    >
+      <span className="inline-block w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "var(--color-accent)" }} />
+      <span>{label} ({elapsed}s){completedSuffix}</span>
     </div>
   );
 }

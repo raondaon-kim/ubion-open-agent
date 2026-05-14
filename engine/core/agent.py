@@ -176,6 +176,9 @@ class AIAgent:
         )
         self._curator_turns_since_run = 0
         self._curator_thread = None  # last spawned thread (for tests)
+        # Set by run_conversation when the caller wants fine-grained
+        # progress events (used by the SSE chat endpoint).
+        self._progress_callback: Optional[Any] = None
 
         # Transcript of API turns. Each entry is an Anthropic-shaped dict.
         # Curator walks this list at curator.py:1751 to pull tool_calls
@@ -251,11 +254,25 @@ class AIAgent:
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         task_id: Optional[str] = None,
         persist_user_message: Optional[str] = None,
+        progress_callback: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Run one user_message through the loop and return a result dict.
 
         Returns curator-shaped dict (see ConversationResult). Never raises;
         unexpected exceptions are caught and surfaced as ``error``.
+
+        ``progress_callback`` — optional ``(event_type, payload) -> None``
+        hook the loop calls at well-defined points so SSE callers can
+        report fine-grained progress to the user. Events:
+
+            * ``llm_call_started``   — about to call the LLM
+            * ``tool_call_started``  — payload includes ``name``
+            * ``tool_call_finished`` — payload includes ``name``, ``ok``
+            * ``final_text``         — payload includes ``text``
+            * ``done``               — payload includes ``exit_reason``
+
+        The callback runs on the AIAgent's thread; keep it cheap and
+        thread-safe.
         """
         result = ConversationResult()
         ctx = setup_turn(
@@ -271,12 +288,24 @@ class AIAgent:
             "conversation turn: task=%s history=%d msg=%r",
             ctx.task_id, len(ctx.messages) - 1, _msg_preview,
         )
+        # Attach the callback to ``self`` so _run_loop (and the helpers it
+        # delegates to) can reach it without thread the parameter through
+        # every internal API.
+        self._progress_callback = progress_callback
         try:
             self._run_loop(ctx, result)
         except Exception as exc:  # last-resort guard around the loop
             logger.exception("Agent loop crashed: %s", exc)
             result.exit_reason = result.exit_reason or "loop_exception"
             result.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            # Emit a terminal `done` event so SSE consumers can close their
+            # stream regardless of which branch above exited the loop.
+            self._emit_progress("done", {
+                "exit_reason": result.exit_reason or "unknown",
+                "error": result.error,
+            })
+            self._progress_callback = None
         # B-5: fire curator on every Nth successful turn — non-blocking,
         # best-effort. Skipped when the loop crashed (we don't want curator
         # judging a half-finished trajectory) or when the interval is 0.
@@ -286,6 +315,16 @@ class AIAgent:
                 self._curator_turns_since_run = 0
                 self._spawn_curator_background()
         return result.as_dict()
+
+    def _emit_progress(self, event: str, payload: Dict[str, Any]) -> None:
+        """Fire one progress event if a callback is wired. Never raises."""
+        cb = self._progress_callback
+        if cb is None:
+            return
+        try:
+            cb(event, payload)
+        except Exception as exc:
+            logger.debug("progress_callback raised %r — ignoring", exc)
 
     def _spawn_curator_background(self) -> None:
         """Run one curator pass on a daemon thread. Never raises.
@@ -378,6 +417,7 @@ class AIAgent:
                 "engine.tools.memory_tool",
                 "engine.tools.file_tools",
                 "engine.tools.osv_check",
+                "engine.tools.shell",
             ):
                 try:
                     __import__(modname)
@@ -686,6 +726,7 @@ class AIAgent:
             api_call_count += 1
             result.api_calls = api_call_count
 
+            self._emit_progress("llm_call_started", {"turn": api_call_count})
             response = self._call_llm_with_retry(messages)
             if response is None:
                 # _call_llm_with_retry already filled result.error / logged.
@@ -705,6 +746,7 @@ class AIAgent:
                 # No tool calls → the model is done.
                 result.final_response = response.text
                 result.exit_reason = "completed"
+                self._emit_progress("final_text", {"text": response.text})
                 return
 
             # ── Interrupt check #2 — between LLM and tool dispatch ───────
@@ -726,7 +768,14 @@ class AIAgent:
                 result.exit_reason = "interrupted_by_user"
                 return
 
+            for tc in response.tool_calls:
+                self._emit_progress("tool_call_started", {"name": tc.name})
             tool_results = execute_tool_calls_sequential(self, response.tool_calls)
+            for tc, tr in zip(response.tool_calls, tool_results):
+                # tool_results items are Anthropic-shape dicts; presence of
+                # `is_error` flags a failed call.
+                ok = not (isinstance(tr, dict) and tr.get("is_error"))
+                self._emit_progress("tool_call_finished", {"name": tc.name, "ok": ok})
             result.tool_calls_made += len(tool_results)
             messages.append({"role": "user", "content": tool_results})
 

@@ -5,8 +5,10 @@ import {
   fetchServerWorkspace,
   getApiBaseOverride,
   getBearerToken,
+  pickFolderDialog,
   setApiBase,
   setBearerToken,
+  setServerWorkspace as pushServerWorkspace,
 } from "../api/client";
 import { FolderPicker } from "./FolderPicker";
 
@@ -36,12 +38,33 @@ export function SettingsPanel() {
       .catch(() => setServerWorkspace(""));
   }, [base, token]);
 
-  function handleSave() {
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  async function handleSave() {
+    setSaveError(null);
     setBearerToken(token);
     setApiBase(base);
     localStorage.setItem("ubion.workspace", workspace);
+
+    // Push the workspace selection to the server so the agent's next
+    // turn writes to the right folder. Skip the call when the UI value
+    // equals the server value already (no need to re-confirm).
+    if (workspace && workspace !== serverWorkspace) {
+      try {
+        const resolved = await pushServerWorkspace(workspace);
+        setServerWorkspace(resolved);
+      } catch (err) {
+        setSaveError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+    }
     setSaved(true);
     setTimeout(() => setSaved(false), 1600);
+  }
+
+  async function handleNativePick() {
+    const picked = await pickFolderDialog(workspace || serverWorkspace);
+    if (picked) setWorkspace(picked);
   }
 
     return (
@@ -168,14 +191,27 @@ export function SettingsPanel() {
               </code>
               <button
                 type="button"
-                onClick={() => setPickerOpen(true)}
+                onClick={handleNativePick}
                 className="px-3 py-1.5 rounded-md border text-sm whitespace-nowrap"
                 style={{
                   borderColor: "var(--color-border)",
                   color: "var(--color-text-muted)",
                 }}
+                title="OS 기본 폴더 선택 다이얼로그 (앱 모드)"
               >
                 📁 폴더 선택
+              </button>
+              <button
+                type="button"
+                onClick={() => setPickerOpen(true)}
+                className="px-2 py-1.5 rounded-md border text-sm whitespace-nowrap"
+                style={{
+                  borderColor: "var(--color-border)",
+                  color: "var(--color-text-muted)",
+                }}
+                title="서버에서 보이는 폴더 탐색 (브라우저 모드 호환)"
+              >
+                탐색…
               </button>
               {workspace && (
                 <button
@@ -194,8 +230,9 @@ export function SettingsPanel() {
             className="text-xs"
             style={{ color: "var(--color-text-dim)" }}
           >
-            서버 프로세스의 <code>UBION_WORKSPACE</code> 환경변수가 우선합니다.
-            UI 에서 고른 값은 표시용이며 다음 대화 컨텍스트에 반영됩니다.
+            저장하면 서버의 <code>UBION_WORKSPACE</code> 가 즉시 갱신되어
+            다음 대화부터 새 폴더에 파일을 만듭니다. 첫 부팅 시 기본값은{" "}
+            <code>~/Documents/Ubion 에이전트</code> 폴더입니다.
             {serverWorkspace && (
               <>
                 {" "}현재 서버 인식 폴더: <code>{serverWorkspace}</code>
@@ -211,34 +248,38 @@ export function SettingsPanel() {
           onPick={(p) => setWorkspace(p)}
         />
 
-        {/* API 키 (참고용) */}
-        <Section title="LLM API 키">
+        {/* LLM 게이트웨이 (참고용) */}
+        <Section title="LLM 게이트웨이">
           <p
             className="text-sm"
             style={{ color: "var(--color-text-muted)" }}
           >
-            API 키는 사용자별 에이전트 홈의 <code>.env</code> 에 저장하세요:
+            사내 LiteLLM 프록시를 사용합니다. 설치 시 키와 주소가{" "}
+            <code>~/.ubion-agent/.env</code> 에 자동으로 시드되며, 직접 다른
+            키로 교체하고 싶다면 그 파일을 편집한 뒤 트레이 메뉴 →
+            종료/재실행을 한 번 해 주세요.
           </p>
           <pre
             className="text-xs mt-2 px-3 py-2 rounded-md font-mono whitespace-pre-wrap"
             style={{ background: "var(--color-bg-card)", color: "var(--color-text-muted)" }}
           >
-{`# %LOCALAPPDATA%\\.ubion-agent\\.env  (Windows)
-# ~/.ubion-agent/.env                  (macOS/Linux)
-DEEPSEEK_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...`}
+{`# ~/.ubion-agent/.env
+LITELLM_BASE_URL=http://<사내-litellm-호스트>:4000
+LITELLM_API_KEY=sk-...
+ANTHROPIC_MODEL=claude-sonnet-4-6
+DEEPSEEK_MODEL=deepseek-v4-flash`}
           </pre>
-          <p
-            className="text-xs mt-2"
-            style={{ color: "var(--color-text-dim)" }}
-          >
-            저장 후 트레이 메뉴에서 한 번 종료/재실행하면 반영됩니다.
-            개발 모드 (cargo tauri dev) 에서는 프로젝트 루트 <code>.env</code> 도
-            인식합니다.
-          </p>
         </Section>
 
         <div className="flex items-center justify-end gap-3 mt-6">
+          {saveError && (
+            <span
+              className="text-xs"
+              style={{ color: "var(--color-danger)" }}
+            >
+              저장 실패: {saveError}
+            </span>
+          )}
           {saved && (
             <span
               className="text-xs"

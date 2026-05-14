@@ -99,25 +99,55 @@ pub fn spawn_python_backend(app: &AppHandle) -> Option<SpawnedBackend> {
 
     if let Some(home) = layout.python_home.as_ref() {
         cmd.env("PYTHONHOME", home);
-        let lib = home.join("Lib");
-        let site = lib.join("site-packages");
-        let mut pp = std::env::join_paths(
-            [layout.cwd.as_path(), site.as_path(), lib.as_path()]
-                .into_iter()
-                .filter(|p| p.exists()),
-        )
-        .ok();
-        if let Some(joined) = pp.take() {
+        // Stdlib + site-packages live in different places per platform:
+        //   Windows: <home>/Lib, <home>/Lib/site-packages
+        //   Unix:    <home>/lib/python3.X, <home>/lib/python3.X/site-packages
+        // We collect every candidate that exists on disk; Python only
+        // looks at the first match for each module, so the worst case
+        // is a slightly longer PYTHONPATH — never an import failure
+        // from a missing directory.
+        let mut candidates: Vec<PathBuf> = vec![layout.cwd.clone()];
+        candidates.push(home.join("Lib"));
+        candidates.push(home.join("Lib").join("site-packages"));
+        if let Ok(lib_iter) = std::fs::read_dir(home.join("lib")) {
+            for entry in lib_iter.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("python") {
+                    let stdlib = entry.path();
+                    candidates.push(stdlib.clone());
+                    candidates.push(stdlib.join("site-packages"));
+                }
+            }
+        }
+        if let Ok(joined) =
+            std::env::join_paths(candidates.iter().filter(|p| p.exists()))
+        {
             cmd.env("PYTHONPATH", &joined);
         }
         cmd.env("PYTHONNOUSERSITE", "1");
     }
 
-    // We need stdout piped to read the PORT handshake. stderr stays
-    // inherited so uvicorn's startup log surfaces in the Tauri console.
+    // Pipe both stdout and stderr — when the Tauri shell runs without an
+    // attached console (release builds, double-clicked .exe), `inherit`
+    // forces Windows to allocate a fresh console window for any child
+    // that writes to stdio. Piping captures the output silently; the
+    // handshake reader thread then prints anything beyond the PORT line
+    // to *our* log so it still lands in `agent_home/logs/server.log`.
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
+
+    // CREATE_NO_WINDOW (0x08000000) — pure-belt-and-braces flag that
+    // tells Windows never to create a console for this process even if
+    // something inside it would normally do so. Combined with the
+    // GUI-subsystem flag on our own binary, this kills the stray
+    // command-prompt windows users were seeing on every spawn.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -147,6 +177,19 @@ pub fn spawn_python_backend(app: &AppHandle) -> Option<SpawnedBackend> {
         }
     };
 
+    // Drain stderr on its own thread so uvicorn's logs neither (a) fill
+    // the pipe buffer and deadlock the child nor (b) get lost. We just
+    // forward each line into `log::info!` so it lands in the same file
+    // sink as the rest of the app.
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                log::info!("[py-stderr] {}", line);
+            }
+        });
+    }
+
     // Read the handshake on a worker thread so we can apply a timeout
     // without blocking the Tauri setup callback indefinitely. The same
     // thread keeps draining stdout afterwards so the pipe never fills.
@@ -172,12 +215,13 @@ fn read_port_handshake(stdout: ChildStdout) -> u16 {
             }
         };
         let _ = tx.send(parsed);
-        // Drain the rest so uvicorn's logs surface and the pipe never
-        // backs up (which would otherwise deadlock the child once its
-        // pipe buffer fills).
+        // Drain the rest so the pipe never backs up. Forward to our
+        // logger instead of stdout (which doesn't exist in a GUI
+        // subsystem binary, and would otherwise trigger a stray console
+        // window on Windows).
         let mut line = String::new();
         while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-            print!("{}", line);
+            log::info!("[py-stdout] {}", line.trim_end());
             line.clear();
         }
     });
@@ -260,6 +304,12 @@ fn resolve_layout(app: &AppHandle) -> Layout {
 
 fn try_embedded(app: &AppHandle) -> Option<Layout> {
     let resolver = app.path();
+    // Resource layout per platform (see tauri-apps/v2.tauri.app/develop/resources):
+    //   * Windows / Linux: <install>/python/python.exe (or bin/python3)
+    //   * macOS:           <App>.app/Contents/Resources/python/bin/python3
+    // BaseDirectory::Resource hides the platform difference for us — we
+    // just give it the relative path that matches what the bundler
+    // copied from tauri.conf.json > bundle > resources.
     let python = resolver
         .resolve(
             if cfg!(windows) {
@@ -273,12 +323,55 @@ fn try_embedded(app: &AppHandle) -> Option<Layout> {
     if !python.exists() {
         return None;
     }
-    let python_home = python.parent().map(Path::to_path_buf);
-    // engine/ sits alongside python/ in the resource directory.
-    let resource_root = python
-        .parent()
-        .and_then(Path::parent)
+
+    // Tauri's bundler preserves file *contents* but does NOT preserve
+    // POSIX executable bits on macOS / Linux (the resources land
+    // mode 0644). The first time the embedded interpreter runs after a
+    // fresh install, we need to flip the +x bits on python3 itself and
+    // any helper binaries that shipped without them. We do this idempotently
+    // on every spawn — chmod on an already-+x file is a no-op.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = python.metadata() {
+            let mode = meta.permissions().mode();
+            if mode & 0o111 == 0 {
+                let mut perms = meta.permissions();
+                perms.set_mode(mode | 0o755);
+                if let Err(err) = std::fs::set_permissions(&python, perms) {
+                    log::warn!("could not chmod +x {}: {}", python.display(), err);
+                }
+            }
+        }
+    }
+
+    // PYTHONHOME must point at the *prefix* — the directory whose
+    // immediate children are `Lib/` / `DLLs/` (Windows) or `lib/` /
+    // `bin/` / `include/` (Unix). For our layout that is:
+    //   Windows: python.exe lives directly in <prefix>/python.exe,
+    //            so PYTHONHOME = parent of python.exe = "python/"
+    //   Unix:    python3 lives in <prefix>/bin/python3, so
+    //            PYTHONHOME = grandparent = "python/"
+    let python_home = if cfg!(windows) {
+        python.parent().map(Path::to_path_buf)
+    } else {
+        python.parent().and_then(Path::parent).map(Path::to_path_buf)
+    };
+    // engine/ sits alongside python/ in the resource directory on every
+    // platform — the bundler flattens our `resources: ["python/**", "engine/**"]`
+    // list relative to src-tauri/, so cwd is the prefix's parent.
+    let resource_root = python_home
+        .as_ref()
+        .and_then(|p| p.parent())
         .map(Path::to_path_buf)?;
+
+    // macOS: python-build-standalone ships an entire framework tree with
+    // its libraries reachable from python/lib. PYTHONHOME on Unix
+    // should point at `python/` (the prefix), and the interpreter
+    // discovers Lib automatically. On Windows we point at
+    // `python/` (Lib/, DLLs/ siblings) so the resolution stays
+    // identical — both correspond to the prefix the build was made
+    // against.
     Some(Layout {
         mode: "embedded",
         python,

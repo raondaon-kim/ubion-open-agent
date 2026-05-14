@@ -6,11 +6,14 @@ import {
   deleteConversation as apiDeleteConversation,
   listConversations,
 } from "./api/client";
+import { DebugDrawer, appendDebug, type DebugEvent } from "./components/DebugDrawer";
 
 function App() {
   const [activePanel, setActivePanel] = useState<"chat" | "skills" | "memory" | "settings">("chat");
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugEvents, setDebugEvents] = useState<DebugEvent[]>([]);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -24,6 +27,18 @@ function App() {
   useEffect(() => {
     refreshConversations();
   }, [refreshConversations]);
+
+  // Ctrl+Shift+D 로 디버그 드로어 토글
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.ctrlKey && e.shiftKey && (e.key === "D" || e.key === "d")) {
+        e.preventDefault();
+        setDebugOpen((v) => !v);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   function handleNewChat() {
     setCurrentId(null);
@@ -40,6 +55,10 @@ function App() {
     if (currentId === id) setCurrentId(null);
     await refreshConversations();
   }
+
+  const pushDebug = useCallback((ev: Omit<DebugEvent, "ts"> & { ts?: number }) => {
+    appendDebug(setDebugEvents, ev);
+  }, []);
 
   return (
     <div className="flex h-screen w-screen bg-[var(--color-bg)] text-[var(--color-text)]">
@@ -60,8 +79,16 @@ function App() {
             setCurrentId(meta.id);
             refreshConversations();
           }}
+          onDebugEvent={pushDebug}
+          onToggleDebug={() => setDebugOpen((v) => !v)}
         />
       </main>
+      <DebugDrawer
+        open={debugOpen}
+        onClose={() => setDebugOpen(false)}
+        events={debugEvents}
+        onClear={() => setDebugEvents([])}
+      />
     </div>
   );
 }

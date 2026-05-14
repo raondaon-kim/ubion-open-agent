@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Ubion 에이전트",
+  "productName": "Ubion_Agent",
   "version": "0.1.0",
   "identifier": "com.ubion.agent",
   "build": {
@@ -27,7 +27,7 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "dmg", "app"],
     "category": "Productivity",
     "shortDescription": "Self-evolving AI agent (Ubion ax center)",
     "longDescription": "사내 사용자의 PC 에서 동작하는 자기진화 에이전트. 트레이 상주 + 임베디드 Python + Tauri 외피.",
@@ -48,6 +48,12 @@
         "installMode": "currentUser",
         "languages": ["English", "Korean"],
         "compression": "lzma"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "dmg": {
+        "windowSize": { "width": 660, "height": 400 }
       }
     }
   },

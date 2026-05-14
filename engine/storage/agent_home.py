@@ -76,6 +76,32 @@ def get_env_path() -> Path:
     return get_hermes_home() / ".env"
 
 
+_WORKSPACE_FOLDER_NAME = "Ubion 에이전트"
+
+
+def default_workspace_root() -> Path:
+    """Pick the OS-appropriate default workspace folder.
+
+    The user can override via UBION_WORKSPACE or the Settings UI, but
+    we need *some* concrete path on first boot — different machines
+    don't share drives, so a hardcoded D:\\poems doesn't work for
+    everyone.
+
+    Choice rationale:
+      * Both Windows and macOS expose ``~/Documents`` as a stable
+        per-user folder that users intuit as "place to keep my files".
+      * Linux follows the same XDG convention (xdg-user-dirs typically
+        provides `~/Documents` too).
+      * We put a single ``Ubion 에이전트`` subfolder under it so the
+        workspace is identifiable in Explorer/Finder and so we don't
+        scatter files in the root of Documents.
+
+    The folder is *not* created here — get_workspace() handles that
+    on first read.
+    """
+    return Path.home() / "Documents" / _WORKSPACE_FOLDER_NAME
+
+
 def get_workspace() -> Path:
     """Return the agent's current *working* directory — the user's content.
 
@@ -85,19 +111,90 @@ def get_workspace() -> Path:
     want help with, etc.
 
     Resolution order:
-      1. ``UBION_WORKSPACE`` env var (explicit override)
-      2. Current process cwd (``Path.cwd()``)
+      1. ``UBION_WORKSPACE`` env var — set either via the .env (seeded
+         on first boot or hand-edited) or by the Settings UI calling
+         ``set_workspace``.
+      2. OS-appropriate default (``~/Documents/Ubion 에이전트``).
+         Created on demand so a fresh install has somewhere to write
+         immediately.
 
-    The user is expected to flip this between sessions (e.g.
-    ``set UBION_WORKSPACE=D:\\poems\\classical`` before launching the
-    agent), or the agent harness picks a default cwd. The prompt builder
-    reads context files (SOUL.md, HERMES.md, AGENTS.md, CLAUDE.md,
-    .cursorrules) from this directory.
+    The prompt builder reads context files (SOUL.md, HERMES.md,
+    AGENTS.md, CLAUDE.md, .cursorrules) from this directory.
     """
     val = os.environ.get("UBION_WORKSPACE", "").strip()
     if val:
         return Path(val)
-    return Path.cwd()
+    target = default_workspace_root()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Filesystem unavailable (rare — read-only home?). Fall back
+        # to cwd rather than crashing the entire agent.
+        return Path.cwd()
+    return target
+
+
+def set_workspace(new_path: Path | str) -> Path:
+    """Persist a new workspace selection.
+
+    Writes UBION_WORKSPACE into the user's ``agent_home/.env`` so that
+    subsequent boots remember the choice, AND sets it on
+    ``os.environ`` so the change takes effect *in the current
+    process* without restart.
+
+    Returns the resolved Path the agent will use from now on. Caller
+    is responsible for telling running components that read the
+    workspace eagerly (e.g. the prompt builder cache) to refresh.
+
+    Errors:
+      * ValueError if the path is empty / not absolute (we refuse
+        relative paths because they're ambiguous in a Tauri webview
+        context — the renderer's cwd != the server's cwd).
+      * OSError if the directory can't be created.
+    """
+    path = Path(new_path).expanduser()
+    if not str(path).strip():
+        raise ValueError("workspace path is empty")
+    if not path.is_absolute():
+        raise ValueError(f"workspace path must be absolute: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+
+    env_file = get_env_path()
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    _write_env_var(env_file, "UBION_WORKSPACE", str(path))
+
+    os.environ["UBION_WORKSPACE"] = str(path)
+    return path
+
+
+def _write_env_var(env_file: Path, key: str, value: str) -> None:
+    """In-place upsert of one KEY=VALUE line in a .env file.
+
+    Preserves other lines (comments, other settings) verbatim. If the
+    file doesn't exist we create it with just this one line. We
+    deliberately don't use python-dotenv's set_key here — it rewrites
+    quoting in ways that surprise users editing the file by hand, and
+    a simple line-rewriter is enough for our two-key surface.
+    """
+    new_line = f"{key}={value}"
+    if not env_file.exists():
+        env_file.write_text(new_line + "\n", encoding="utf-8")
+        return
+
+    out_lines: list[str] = []
+    replaced = False
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("#") and "=" in stripped:
+            existing_key = stripped.split("=", 1)[0].strip()
+            if existing_key == key:
+                out_lines.append(new_line)
+                replaced = True
+                continue
+        out_lines.append(line)
+    if not replaced:
+        out_lines.append(new_line)
+    env_file.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
 def display_hermes_home() -> str:
@@ -331,18 +428,110 @@ def ensure_bundled_skills_seeded() -> dict:
 
     Phase 1 (B) (시 시나리오) — 빈 풀에서 시작해 자기진화로 ``skills/custom/``
     이 채워지는 과정을 관찰하는 것이 핵심 검증 게이트 (§9 (B)).
+
+    또한 이 함수는 *최초 부팅 onboarding* 도 처리한다: SOUL.md / USER.md
+    가 없으면 중립 템플릿을 깔아 첫 대화가 '시 동반자' 같은 고정 페르소나
+    로 시작하지 않도록 한다.
     """
-    # 빈 디렉터리만 보장 — `skill_view` / `skill_manage` 가 디렉터리 부재 시 깨지지 않도록.
     skills_dir = get_skills_dir()
     skills_dir.mkdir(parents=True, exist_ok=True)
     (skills_dir / "custom").mkdir(parents=True, exist_ok=True)
     (skills_dir / "installed").mkdir(parents=True, exist_ok=True)
+    seed_onboarding_files()
     return {
         "seeded": 0,
         "skipped": 0,
         "version": _OPTIONAL_SKILLS_VERSION,
         "note": "Hermes-식 분리: 자동 시드 비활성화. install_optional_skill() 으로 명시 설치.",
     }
+
+
+# ----------------------------------------------------------------------
+# Onboarding seed — SOUL.md / USER.md neutral templates
+# ----------------------------------------------------------------------
+
+_SOUL_TEMPLATE = """\
+# SOUL — 아직 정의되지 않은 에이전트
+
+이 파일은 **최초 부팅 onboarding 템플릿** 입니다.
+사용자가 어떤 역할의 에이전트를 원하는지 첫 대화에서 들어보고,
+이 파일을 *그 자리에서 통째로 다시 써* 정체성을 확정합니다.
+
+## 첫 대화 행동 강령
+
+1. 인사 후, 사용자에게 다음을 *간단히* 묻습니다 (한 번에 1-2개씩):
+   - 어떤 업무를 자주 하나요? (예: 코딩, 마케팅, 시 쓰기, 데이터 분석)
+   - 에이전트가 무엇을 도와주길 원하나요?
+   - 어떤 톤을 좋아하나요? (간결/따뜻/엄격)
+2. 사용자가 충분히 답하면, **`file_ops` 도구로 이 SOUL.md 를 새 내용으로
+   덮어씁니다.** 그 안에:
+   - 정체성 한 문장
+   - 작업 원칙 3-5줄
+   - 사용할 도구 우선순위 표
+   - 금지 항목
+3. USER.md 도 사용자 정보 (이름·역할·취향) 를 받은 만큼 채웁니다.
+4. "이제 정체성이 정해졌습니다. 다시 인사할게요." 라고 한 줄 알리고
+   확정된 페르소나로 두 번째 대화를 시작합니다.
+
+## 기본 원칙 (페르소나 확정 전 임시)
+
+- 한국어가 기본. 영어는 인용/참고 시만.
+- 답을 강요하지 않고, 선택지를 제시.
+- 워크스페이스(`UBION_WORKSPACE`) 안의 파일은 *읽기 + 새로 만들기* 만 가능.
+  수정·삭제 금지.
+- 사용자가 같은 작업을 3회 이상 반복하면 `skill_manage` 로 `skills/custom/`
+  에 SKILL.md 를 만듭니다 (한 세션에 새 skill 3개 이상 금지).
+
+## 사용 가능한 핵심 도구
+
+- `read_file` / `list_files` — 워크스페이스 파일 읽기 / 목록
+- `create_workspace_file` — 새 파일 만들기 (binary 도 base64 로 가능)
+- `shell` — PowerShell / cmd / bash 명령 실행 (워크스페이스 안에서만,
+  60초 타임아웃, 파괴적 명령은 자동 차단). docx/xlsx 같은 office 파일을
+  만들 때 `shell` 로 `python -c "from docx import Document; ..."` 형태로
+  스크립트를 돌리세요 — python-docx, openpyxl 등이 이미 임베드되어 있을
+  수도 있고, 없으면 `pip install --user` 로 한 번만 깔면 됩니다.
+- `todo` — 다단계 작업의 진행 상황 관리
+- `memory` — USER.md / 메모리 파일 갱신
+- `skills_search` / `skills_install` — 86개 시드 스킬 풀에서 검색·설치
+
+---
+
+생성일: 자동 (ensure_bundled_skills_seeded)
+사용자가 첫 대화로 페르소나를 정하면 이 파일은 그 시점에 사라지고
+새 SOUL.md 로 대체됩니다.
+"""
+
+_USER_TEMPLATE = """\
+# USER — 아직 비어 있음
+
+첫 대화에서 사용자에게 직접 물어 채우세요. 예시 필드:
+
+- 이름:
+- 역할/직무:
+- 자주 다루는 도구·언어:
+- 답변 톤 선호:
+- 절대 하지 말아야 할 것:
+"""
+
+
+def seed_onboarding_files() -> dict:
+    """Write neutral SOUL.md / USER.md if they don't already exist.
+
+    Never overwrites existing files — once the agent (or the user) has
+    written its own SOUL, that file is the source of truth.
+
+    Returns a small dict so callers can log what happened on first boot.
+    """
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    created: list[str] = []
+    for name, content in (("SOUL.md", _SOUL_TEMPLATE), ("USER.md", _USER_TEMPLATE)):
+        target = home / name
+        if not target.exists():
+            target.write_text(content, encoding="utf-8")
+            created.append(name)
+    return {"created": created, "home": str(home)}
 
 
 # (Original bulk-seed routine — kept here for one-shot recovery if a user
