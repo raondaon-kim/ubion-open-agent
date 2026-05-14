@@ -409,6 +409,33 @@ async def _stream_with_progress(
             })
             continue
 
+        # Reasoning stream (DeepSeek thinking mode). Carry the chunks
+        # in the ``ubion`` side channel so OpenAI-only clients ignore
+        # them and our own UI can render the preview. We don't push
+        # reasoning into ``delta.content`` because that would land in
+        # the actual answer bubble.
+        if event_type == "reasoning_delta":
+            chunk = payload.get("text", "") or ""
+            if not chunk:
+                continue
+            yield _sse_chunk({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": None,
+                }],
+                "ubion": {
+                    "stage": "thinking",
+                    "reasoning": chunk,
+                    "turn": payload.get("turn"),
+                },
+            })
+            continue
+
         if event_type == "final_text":
             final_text = payload.get("text", "") or ""
             # If text_delta events already streamed the same content,

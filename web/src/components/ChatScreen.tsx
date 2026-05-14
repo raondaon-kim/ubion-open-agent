@@ -155,6 +155,28 @@ export function ChatScreen({ panel, currentId, onConversationSaved, onDebugEvent
             if (!last || last.role !== "assistant") return prev;
             const prevProgress = last.progress;
             const completed = prevProgress?.toolsCompleted ?? 0;
+
+            // reasoning_delta: accumulate the chain-of-thought stream
+            // into the existing thinking progress so ProgressHint can
+            // render a preview. We DO NOT reset startedAt here — the
+            // elapsed counter should keep ticking from when thinking
+            // first began, not reset on every chunk.
+            if (event.stage === "thinking" && event.reasoning) {
+              const prior = prevProgress?.reasoning ?? "";
+              const merged = (prior + event.reasoning).slice(-800);
+              copy[copy.length - 1] = {
+                ...last,
+                progress: {
+                  stage: "thinking",
+                  startedAt: prevProgress?.startedAt ?? Date.now(),
+                  toolsCompleted: completed,
+                  lastTool: prevProgress?.lastTool,
+                  reasoning: merged,
+                },
+              };
+              return copy;
+            }
+
             if (event.stage === "thinking") {
               copy[copy.length - 1] = {
                 ...last,
@@ -162,6 +184,11 @@ export function ChatScreen({ panel, currentId, onConversationSaved, onDebugEvent
                   stage: "thinking",
                   startedAt: Date.now(),
                   toolsCompleted: completed,
+                  lastTool: prevProgress?.lastTool,
+                  // Fresh thinking phase — drop the prior reasoning
+                  // preview so the old text doesn't shadow the new
+                  // turn's chain-of-thought.
+                  reasoning: undefined,
                 },
               };
             } else if (event.stage === "tool") {
@@ -172,6 +199,8 @@ export function ChatScreen({ panel, currentId, onConversationSaved, onDebugEvent
                   toolName: event.toolName,
                   startedAt: Date.now(),
                   toolsCompleted: completed,
+                  lastTool: prevProgress?.lastTool,
+                  reasoning: undefined,
                 },
               };
             } else if (event.stage === "tool_done") {
@@ -181,6 +210,8 @@ export function ChatScreen({ panel, currentId, onConversationSaved, onDebugEvent
                   stage: "thinking",
                   startedAt: Date.now(),
                   toolsCompleted: completed + 1,
+                  lastTool: event.toolName ?? prevProgress?.toolName,
+                  reasoning: undefined,
                 },
               };
             }
@@ -509,19 +540,62 @@ function ProgressHint({ progress }: { progress: NonNullable<Message["progress"]>
     return () => clearInterval(t);
   }, []);
   const elapsed = Math.max(0, Math.floor((now - progress.startedAt) / 1000));
-  const label = progress.stage === "tool"
-    ? `도구 실행: ${progress.toolName ?? "?"}`
-    : "생각하는 중";
+  const label =
+    progress.stage === "tool"
+      ? `도구 실행: ${progress.toolName ?? "?"}`
+      : "생각하는 중";
   const completedSuffix = progress.toolsCompleted
     ? ` · 도구 ${progress.toolsCompleted}회 완료`
     : "";
+  const lastToolSuffix = progress.lastTool
+    ? ` · 직전: ${progress.lastTool}`
+    : "";
+
+  // After 20s the label color shifts so the user can tell at a glance
+  // the model is in a long reasoning burst (not stuck) vs. a quick
+  // turn. We don't change the spinner — just the text tone.
+  const slow = elapsed >= 20;
+
+  // Reasoning preview — show the tail (last ~120 chars across line
+  // breaks). DeepSeek thinking arrives as discrete sentences in
+  // Korean / English, so showing the most recent fragment is
+  // informative without overwhelming the chat.
+  const preview = (progress.reasoning ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const previewTail = preview.length > 120 ? "…" + preview.slice(-120) : preview;
+
   return (
-    <div
-      className="text-xs px-3 py-1 rounded-full inline-flex items-center gap-2 self-start"
-      style={{ background: "var(--color-bg-hover)", color: "var(--color-text-muted)" }}
-    >
-      <span className="inline-block w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "var(--color-accent)" }} />
-      <span>{label} ({elapsed}s){completedSuffix}</span>
+    <div className="flex flex-col gap-1 self-start max-w-full">
+      <div
+        className="text-xs px-3 py-1 rounded-full inline-flex items-center gap-2"
+        style={{
+          background: "var(--color-bg-hover)",
+          color: slow ? "var(--color-text)" : "var(--color-text-muted)",
+        }}
+      >
+        <span
+          className="inline-block w-1.5 h-1.5 rounded-full animate-pulse"
+          style={{ background: "var(--color-accent)" }}
+        />
+        <span>
+          {label} ({elapsed}s){completedSuffix}{lastToolSuffix}
+        </span>
+      </div>
+      {previewTail && (
+        <div
+          className="text-xs px-3 py-1 rounded-md max-w-2xl"
+          style={{
+            background: "var(--color-surface)",
+            color: "var(--color-text-dim)",
+            fontStyle: "italic",
+            lineHeight: 1.45,
+          }}
+          title="모델이 사고 중인 내용 (DeepSeek thinking)"
+        >
+          💭 {previewTail}
+        </div>
+      )}
     </div>
   );
 }

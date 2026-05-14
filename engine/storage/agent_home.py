@@ -501,6 +501,38 @@ _SOUL_TEMPLATE = """\
    설치, 만들어 둔 스크립트 실행. 작품 본문을 shell here-string 으로
    짜지 마세요.
 
+## 작업유형 → 스킬 빠른 매핑
+
+사용자 메시지가 아래 키워드 중 하나라도 포함하면, 답변/코드 작성 전에
+**반드시** 해당 스킬을 먼저 로드:
+
+| 키워드 / 작업 | `skill_view(name=...)` |
+|---|---|
+| pptx · ppt · 슬라이드 · 프레젠테이션 · 발표자료 · 덱(deck) | `powerpoint` |
+| docx · 워드 · 문서 · 보고서(서식) | (해당 스킬 있으면) |
+| xlsx · 엑셀 · 스프레드시트 | (해당 스킬 있으면) |
+| 다이어그램 · 아키텍처 · 시스템 도해 | `architecture-diagram` |
+| 영상 · 애니메이션 · 모션 그래픽 | `manim-video` |
+| 인포그래픽 · 비주얼 자료 | `baoyu-infographic` |
+| 시(poetry) 작품 다듬기 | `yoon-dong-ju-poetry-style` (custom) |
+| 코드 리뷰 · PR · 검토 | `github-code-review` |
+| 디버깅 · 버그 추적 | `systematic-debugging` |
+| 테스트 작성 · TDD | `test-driven-development` |
+| 계획 수립 · roadmap | `plan` 또는 `writing-plans` |
+
+키워드가 안 맞으면 `skill_view` 를 건너뛰지 말고 `<available_skills>`
+인덱스를 한 번 더 훑어 보세요. 매칭이 모호하면 "이 작업에 X 스킬이
+도움될 것 같아 먼저 로드합니다" 라고 한 줄 알리고 진행.
+
+## 다단계 작업은 `delegate_task` 로 분리
+
+PPTX 7장, 보고서 작성 + 데이터 분석 등 *한 컨텍스트에 다 담으면
+부풀어 오를* 작업은 `delegate_task` 로 자식 에이전트에게 위임:
+- 단일 모드: `delegate_task(goal="...", context="...")`
+- 병렬 모드: `delegate_task(tasks=[{goal:...}, {goal:...}])` (최대 4개)
+자식은 부모 컨텍스트를 못 보니까 `context` 에 필요한 사실·파일 경로를
+넣어줘야 합니다. 자식 결과는 JSON 으로 돌아옵니다.
+
 ## 그 외 도구
 
 - `read_file` / `list_files` — 어디든 읽기 자유

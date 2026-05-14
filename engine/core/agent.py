@@ -534,7 +534,41 @@ class AIAgent:
             self._system_prompt = ""
             return ""
 
+        # Section order matters for smaller models (DeepSeek flash etc.).
+        # "Lost in the middle" hits prompts where rules and the skills
+        # index are buried between a long intro and the user turn. We
+        # place identity + skill-routing TABLE (SOUL.md) first so the
+        # model is primed with the operating rules; then the
+        # <available_skills> index (which is where it learns *what is
+        # available*); memory last because it's per-conversation drift.
         parts: List[str] = []
+
+        # Workspace = the user's current target directory (poems folder,
+        # codebase, etc.) — distinct from the agent's persistent home.
+        # Setting UBION_WORKSPACE flips the context files the prompt
+        # builder reads (SOUL.md / HERMES.md / AGENTS.md / CLAUDE.md /
+        # .cursorrules under that directory).
+        from engine.storage.agent_home import get_workspace, get_hermes_home
+        try:
+            workspace = get_workspace()
+            ctx_text = build_context_files_prompt(cwd=str(workspace))
+        except Exception as exc:
+            logger.debug("build_context_files_prompt failed: %s", exc)
+            ctx_text = ""
+        # Hermes' build_context_files_prompt only walks the workspace.
+        # Our SOUL.md lives in agent_home (~/.ubion-agent/SOUL.md) so
+        # we read it explicitly and prepend.
+        try:
+            soul_path = get_hermes_home() / "SOUL.md"
+            if soul_path.is_file():
+                soul_body = soul_path.read_text(encoding="utf-8", errors="replace")
+                if soul_body.strip():
+                    parts.append(
+                        f"# AGENT IDENTITY (~/.ubion-agent/SOUL.md)\n\n{soul_body}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not read SOUL.md: %s", exc)
+
         try:
             skills_text = build_skills_system_prompt(
                 available_tools=self.valid_tool_names or None,
@@ -544,19 +578,6 @@ class AIAgent:
             skills_text = ""
         if skills_text and skills_text.strip():
             parts.append(skills_text)
-
-        # Workspace = the user's current target directory (poems folder,
-        # codebase, etc.) — distinct from the agent's persistent home.
-        # Setting UBION_WORKSPACE flips the context files the prompt
-        # builder reads (SOUL.md / HERMES.md / AGENTS.md / CLAUDE.md /
-        # .cursorrules under that directory).
-        from engine.storage.agent_home import get_workspace
-        try:
-            workspace = get_workspace()
-            ctx_text = build_context_files_prompt(cwd=str(workspace))
-        except Exception as exc:
-            logger.debug("build_context_files_prompt failed: %s", exc)
-            ctx_text = ""
         if ctx_text and ctx_text.strip():
             parts.append(ctx_text)
 
@@ -753,17 +774,30 @@ class AIAgent:
 
             self._emit_progress("llm_call_started", {"turn": api_call_count})
 
-            # Forward incremental text chunks to the progress callback so
-            # the SSE endpoint can push real token-by-token deltas to the
-            # UI instead of holding the whole reply until the model
-            # finishes. Falls back to the non-streaming path when the
-            # underlying client doesn't expose chat_stream() (Anthropic /
-            # DeepSeek direct paths in the current build).
+            # Forward incremental text + reasoning chunks to the
+            # progress callback so the SSE endpoint can push real
+            # token-by-token deltas to the UI. Without this, a 30 s
+            # DeepSeek thinking burst looks like a frozen spinner;
+            # with it, the user sees the reasoning unfold and knows
+            # the agent is alive. text_delta goes to the assistant
+            # bubble; reasoning_delta rides a separate "thinking"
+            # channel so the UI can render it differently (dimmed
+            # preview vs. final answer).
             def _on_text_delta(chunk: str, _i=api_call_count) -> None:
                 if chunk:
                     self._emit_progress("text_delta", {"text": chunk, "turn": _i})
 
-            response = self._call_llm_with_retry(messages, on_text_delta=_on_text_delta)
+            def _on_reasoning_delta(chunk: str, _i=api_call_count) -> None:
+                if chunk:
+                    self._emit_progress(
+                        "reasoning_delta", {"text": chunk, "turn": _i}
+                    )
+
+            response = self._call_llm_with_retry(
+                messages,
+                on_text_delta=_on_text_delta,
+                on_reasoning_delta=_on_reasoning_delta,
+            )
             if response is None:
                 # _call_llm_with_retry already filled result.error / logged.
                 # Distinguish interrupt-during-retry from retry exhaustion.
@@ -828,15 +862,20 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         *,
         on_text_delta: Optional[Callable[[str], None]] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
     ) -> Optional[ChatResponse]:
         """Send one turn with retry. Returns None when all retries are spent.
 
         When ``on_text_delta`` is provided AND the underlying client
         exposes ``chat_stream`` (currently LiteLLM only), we take the
         streaming path so the agent can emit ``text_delta`` progress
-        events for the SSE endpoint. Otherwise the call falls back to
-        the non-streaming ``chat`` method — the returned ChatResponse
-        shape is identical.
+        events for the SSE endpoint. ``on_reasoning_delta`` rides the
+        same stream — DeepSeek thinking mode emits chain-of-thought
+        in ``reasoning_content`` chunks; surfacing those to the SSE
+        client kills the "frozen for 30 s" UX during reasoning bursts.
+
+        Falls back to the non-streaming ``chat`` method when streaming
+        isn't available — the returned ChatResponse shape is identical.
         """
         tool_schemas: Optional[List[Dict[str, Any]]] = None
         if self._tools:
@@ -872,6 +911,7 @@ class AIAgent:
                         system=active_system_prompt or None,
                         tools=tool_schemas,
                         on_text_delta=on_text_delta,
+                        on_reasoning_delta=on_reasoning_delta,
                     )
                 return self._llm.chat(
                     messages=messages,

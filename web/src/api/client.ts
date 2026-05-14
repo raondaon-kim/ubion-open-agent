@@ -300,6 +300,12 @@ export interface ProgressEvent {
   ok?: boolean;
   /** llm 호출 회차 (1-based) */
   turn?: number;
+  /**
+   * DeepSeek thinking mode chain-of-thought 청크. stage="thinking" 일
+   * 때 비동기적으로 흘러옴 — 30초짜리 reasoning 동안 사용자에게
+   * "에이전트가 살아 움직이고 있다" 는 신호를 주는 핵심.
+   */
+  reasoning?: string;
 }
 
 export interface ChatRequestParams {
@@ -366,6 +372,8 @@ export async function streamChatCompletion(
               toolName: ubion.tool_name ?? undefined,
               ok: typeof ubion.ok === "boolean" ? ubion.ok : undefined,
               turn: typeof ubion.turn === "number" ? ubion.turn : undefined,
+              reasoning:
+                typeof ubion.reasoning === "string" ? ubion.reasoning : undefined,
             });
           }
         } catch {

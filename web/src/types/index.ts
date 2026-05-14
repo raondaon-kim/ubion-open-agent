@@ -10,6 +10,14 @@ export interface ProgressState {
   startedAt: number;
   /** 최근에 끝낸 도구의 누적 카운트 (UX 용) */
   toolsCompleted?: number;
+  /** 마지막으로 끝난 도구 이름 — "직전: skill_view 완료" 표시용 */
+  lastTool?: string;
+  /**
+   * DeepSeek thinking mode 의 reasoning 청크 누적. 30초짜리 사고 동안
+   * 사용자가 "에이전트가 살아있다" 를 확인할 수 있게 ProgressHint 가
+   * 마지막 1-2 줄을 미리보기로 표시.
+   */
+  reasoning?: string;
 }
 
 export interface Message {

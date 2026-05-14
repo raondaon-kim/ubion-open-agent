@@ -131,6 +131,7 @@ class LiteLLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         on_text_delta: Optional[Callable[[str], None]] = None,
+        on_reasoning_delta: Optional[Callable[[str], None]] = None,
     ) -> ChatResponse:
         """Streaming sibling of :meth:`chat`.
 
@@ -145,10 +146,13 @@ class LiteLLMClient:
           * ``on_text_delta`` fires for every non-empty
             ``delta.content`` chunk. The caller is responsible for any
             UI thread hopping / queue.put_nowait dance.
-          * ``reasoning_content`` deltas are accumulated and returned in
-            the final ChatResponse but NOT pushed through
-            ``on_text_delta`` — the agent loop already special-cases
-            reasoning echoing for DeepSeek thinking mode.
+          * ``reasoning_content`` deltas (DeepSeek thinking mode) are
+            forwarded to ``on_reasoning_delta`` when provided and
+            always accumulated for the final ChatResponse. The agent
+            loop echoes the accumulated reasoning back on the next
+            turn; the delta callback exists so the SSE endpoint can
+            stream thinking in real time — without it the UI shows
+            a silent 30-second "thinking" spinner.
           * ``tool_calls`` arrive as partial chunks (id + name early,
             arguments string built up across many chunks). We assemble
             them here so the returned ChatResponse looks identical to
@@ -198,10 +202,17 @@ class LiteLLMClient:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("on_text_delta raised: %s", exc)
 
-            # Reasoning delta — accumulate silently (echoed in next turn).
+            # Reasoning delta — accumulate AND forward so the UI can show
+            # the thinking stream in real time. Echoed back to the LLM
+            # on the next turn via the final ChatResponse.
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 reasoning_parts.append(str(reasoning))
+                if on_reasoning_delta is not None:
+                    try:
+                        on_reasoning_delta(str(reasoning))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("on_reasoning_delta raised: %s", exc)
 
             # Tool call fragments — assemble by index.
             raw_calls = getattr(delta, "tool_calls", None) or []

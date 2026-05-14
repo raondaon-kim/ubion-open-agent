@@ -97,6 +97,50 @@ def reset_iteration_budget(
     return agent.iteration_budget
 
 
+# Keyword → skill routing table. Smaller models (DeepSeek flash etc.)
+# don't reliably scan the <available_skills> index buried in a 9 KB
+# system prompt; sticking a one-line "load this skill first" hint
+# right before the user's message lifts skill-load rate dramatically.
+#
+# The mapping is intentionally conservative — only entries we ship and
+# that have a sharp keyword signal. False positives push the model to
+# load an irrelevant skill (cheap, recoverable); false negatives mean
+# the model goes back to its old shell-everything habit (expensive).
+_SKILL_KEYWORD_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("pptx", "ppt", "슬라이드", "프레젠테이션", "발표자료", "deck", "powerpoint"),
+        "powerpoint",
+    ),
+    (
+        ("다이어그램", "아키텍처", "architecture diagram", "system diagram"),
+        "architecture-diagram",
+    ),
+    (("manim", "애니메이션", "모션 그래픽"), "manim-video"),
+    (("인포그래픽", "infographic"), "baoyu-infographic"),
+    (("ascii art", "아스키 아트", "아스키아트"), "ascii-art"),
+    (("github 리뷰", "code review", "코드 리뷰", "pr 리뷰"), "github-code-review"),
+    (("디버깅", "버그 추적", "systematic debug"), "systematic-debugging"),
+    (("tdd", "test-driven", "테스트 작성"), "test-driven-development"),
+    (("계획 수립", "roadmap", "writing plan"), "writing-plans"),
+)
+
+
+def _route_skill_hint(user_message: str) -> Optional[str]:
+    """Return the *first* skill name whose keyword set hits in ``user_message``.
+
+    Case-insensitive. Korean/English mix is treated uniformly because
+    the keyword strings include both. Returns None when nothing
+    matches — the agent then falls back to its general skill-scan.
+    """
+    if not isinstance(user_message, str) or not user_message:
+        return None
+    lowered = user_message.lower()
+    for keywords, skill_name in _SKILL_KEYWORD_HINTS:
+        if any(kw.lower() in lowered for kw in keywords):
+            return skill_name
+    return None
+
+
 def hydrate_messages(
     conversation_history: Optional[List[Dict[str, Any]]],
     user_message: str,
@@ -106,11 +150,28 @@ def hydrate_messages(
     The caller's `conversation_history` is copied (not aliased) so a
     crashing turn cannot leave half-written tool_use blocks in the
     caller's list. The fresh user turn is appended last.
+
+    When the user's message matches a known skill keyword, a single
+    line ``[SYSTEM HINT: ...]`` is prepended so the model sees it as
+    the first thing in its turn. Hermes doesn't ship this — but our
+    target models (DeepSeek flash) need the extra nudge or the skill
+    index goes unread.
     """
     messages: List[Dict[str, Any]] = (
         list(conversation_history) if conversation_history else []
     )
-    messages.append({"role": "user", "content": user_message})
+    skill = _route_skill_hint(user_message)
+    if skill:
+        prefixed = (
+            f"[SYSTEM HINT: This task matches the `{skill}` skill. "
+            f"Before doing anything else, call "
+            f"`skill_view(name=\"{skill}\")` to load its workflow. "
+            f"Do not skip — the skill has the canonical commands and "
+            f"will save many tool calls.]\n\n{user_message}"
+        )
+        messages.append({"role": "user", "content": prefixed})
+    else:
+        messages.append({"role": "user", "content": user_message})
     return messages
 
 
