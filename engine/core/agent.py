@@ -76,6 +76,45 @@ DEFAULT_MAX_ITERATIONS = 90
 DEFAULT_MAX_RETRIES_PER_CALL = 6
 
 
+# Always-on operating rules prepended to every system prompt. Live ahead of
+# SOUL.md so the model treats them as invariant policy rather than a
+# persona tweak the user can override mid-conversation. Two rules so far,
+# both born from real failure modes:
+#
+#  1. "Talk to the user every turn" — without this, the model goes silent
+#     for 20+ turns while it calls tools, and from the UI it looks frozen.
+#  2. "Use create_workspace_file for build artifacts, not write_file" —
+#     write_file is for agent_home (the agent's brain); workspace files
+#     are the user's deliverables and belong under UBION_WORKSPACE.
+_OPERATING_RULES = """\
+# OPERATING RULES (always on, override persona)
+
+## 1. Talk to the user every turn
+Tool calls are invisible to the user — silence reads as "hung". Before
+every tool call, write ONE short Korean sentence stating the *purpose*
+of the next action (not the tool name):
+
+- ✓ "발표 자료에 쓸 powerpoint 워크플로를 먼저 펴 볼게요."
+- ✓ "이제 7장짜리 본문을 작성합니다."
+- ✓ "결과 파일에 글자 잘림이 없는지 시각 검수 중입니다."
+- ✗ (empty text + skill_view tool_call) — looks frozen
+- ✗ "skill_view 를 호출합니다" — tool name, not purpose
+
+When the next action stays in the same phase as the previous turn
+(e.g. several shell calls debugging the same error), one sentence per
+*phase change* is fine — don't repeat the same status line every turn.
+
+## 2. Build artifacts go to the workspace
+The user's workspace (UBION_WORKSPACE) is where deliverables (.pptx,
+.docx, .py scripts that produced them, QA scripts) belong.
+``create_workspace_file`` for the first write, ``append_file`` for
+chunked additions, ``patch`` for targeted edits to scripts the agent
+created. ``write_file`` is for the agent home — skills, references,
+scratch notes, never user deliverables. The workspace stays
+create-only; existing user files are never modified or deleted.
+"""
+
+
 @dataclass
 class Tool:
     """A tool the agent can call.
@@ -557,6 +596,15 @@ class AIAgent:
         # <available_skills> index (which is where it learns *what is
         # available*); memory last because it's per-conversation drift.
         parts: List[str] = []
+
+        # Operating rules go FIRST — small-model attention is strongest at
+        # the prompt head, and these are policy invariants that override
+        # any persona the user pasted into SOUL.md. Observed failure mode
+        # that triggered this addition: a 26-turn task where every turn
+        # had text="" because the model interpreted SOUL's "tools first"
+        # framing as "tools only". From the user's POV the agent went
+        # silent for 4 minutes; they (rightly) thought it had hung.
+        parts.append(_OPERATING_RULES)
 
         # Workspace = the user's current target directory (poems folder,
         # codebase, etc.) — distinct from the agent's persistent home.
